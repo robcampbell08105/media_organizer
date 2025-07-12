@@ -1,0 +1,1146 @@
+import os
+import json
+from PIL import Image, ExifTags
+from datetime import datetime, timedelta # Import timedelta
+from tqdm import tqdm
+import subprocess
+import argparse # For command-line arguments to specify config file
+import sys # For exiting on critical errors
+import logging # For logging progress and debugging information
+import time # For rate limiting API calls
+import requests # For making HTTP requests to Nominatim
+import mysql.connector # ADD THIS LINE
+import shlex
+
+# Import your custom database connection module
+try:
+    import db_connection
+except ImportError:
+    print("Error: db_connection.py module not found. Make sure it's in the same directory or in your Python path.")
+    sys.exit(1)
+
+# --- Configuration ---
+PHOTO_DIR = '/multimedia/Photos'
+VIDEO_DIR = '/multimedia/Videos'
+GOOGLE_TAKEOUT_ROOT_DIR = '/home/rwcampbell/Dropbox/Backup/Takeout/Google Photos' # IMPORTANT: Change this!
+
+# Define media file extensions as sets for efficient lookup
+# Added missing extensions: .nef, .raw, .dng (images), .mpg, .mpeg, .asf, .3gp (videos)
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff', '.heic', '.webp', '.nef', '.raw', '.dng'}
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.mpg', '.mpeg', '.asf', '.3gp', '.mkv'}
+ALL_MEDIA_EXTENSIONS = IMAGE_EXTENSIONS.union(VIDEO_EXTENSIONS) # Union for comprehensive scanning
+
+# Nominatim API configuration
+NOMINATIM_API_URL = "https://nominatim.openstreetmap.org/reverse"
+NOMINATIM_USER_AGENT = "processmedia.py/1.0 (robcampbell08105@gmail.com)" # IMPORTANT: Replace with your actual email
+NOMINATIM_DELAY_SECONDS = 1.1 # Minimum 1 second delay between requests as per Nominatim policy
+
+# Configure logging
+# Default level will be INFO, can be changed via command line args
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Database Functions ---
+# Modified to use the imported db_connection module
+def connect_db(config_file, db_section=None):
+    """
+    Establishes a connection to the MySQL database.
+    Args:
+        config_file (str): Path to the MySQL .cnf configuration file.
+        db_section (str, optional): Section in the .cnf file to use. Defaults to None.
+    Returns:
+        mysql.connector.connection.MySQLConnection: The database connection object.
+    """
+    try:
+        # Dynamically adjust the section name if it's 'media' and you're using 'client-media' in .my.cnf
+        # This makes the --section media argument work with [client-media]
+        actual_db_section = db_section
+        if db_section == 'media':
+            actual_db_section = 'client-media'
+            logger.debug(f"Adjusted database section from '{db_section}' to '{actual_db_section}' for .my.cnf compatibility.")
+
+        # CALLING db_connection.connect_to_database WITH ONLY 2 ARGUMENTS
+        conn = db_connection.connect_to_database(config_file, section=actual_db_section)
+        logger.info("Successfully connected to the MySQL database.")
+        return conn
+    except Exception as e:
+        logger.critical(f"Error connecting to MySQL database using {config_file} (section: {db_section}): {e}")
+        sys.exit(1)
+
+def create_tables_if_not_exists(conn):
+    """
+    Creates necessary tables in the database if they do not already exist.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+    """
+    cursor = conn.cursor() # Default cursor is fine for DDL
+    tables = [
+        """
+        CREATE TABLE IF NOT EXISTS faces (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(255) UNIQUE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        # Removed the 'images' table creation due to "Specified key was too long" error and potential redundancy.
+        # Images are now handled directly by the 'Photos' table.
+        """
+        CREATE TABLE IF NOT EXISTS MediaProcessing (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            file_path VARCHAR(2048), -- Changed from UNIQUE to allow longer paths; uniqueness handled with index below
+            processed TINYINT(1) DEFAULT 0,
+            processed_at DATETIME,
+            UNIQUE KEY idx_unique_file_path (file_path(767)) -- Use prefix index for long VARCHAR unique key
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS People (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            person_name VARCHAR(255) UNIQUE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS Photos (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            file_name VARCHAR(255),
+            file_location VARCHAR(2048),
+            resolution VARCHAR(50),
+            size BIGINT,
+            latitude DOUBLE,
+            longitude DOUBLE,
+            altitude DOUBLE,
+            date_taken DATETIME,
+            camera_make VARCHAR(255),
+            camera_model VARCHAR(255),
+            shutter_speed VARCHAR(50),
+            aperture VARCHAR(50),
+            iso VARCHAR(50),
+            flash TINYINT(1),
+            light_meter VARCHAR(50),
+            lens_id VARCHAR(255),
+            lens_spec VARCHAR(255),
+            circle_of_confusion VARCHAR(50)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS photo_faces (
+            photo_id INT,
+            face_id INT,
+            PRIMARY KEY (photo_id, face_id),
+            FOREIGN KEY (photo_id) REFERENCES Photos(id) ON DELETE CASCADE,
+            FOREIGN KEY (face_id) REFERENCES faces(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS Places (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            osm_id BIGINT UNIQUE,           -- OpenStreetMap ID for the place
+            osm_type VARCHAR(50),           -- e.g., 'node', 'way', 'relation'
+            display_name TEXT,              -- Full human-readable address
+            city VARCHAR(255),
+            state VARCHAR(255),
+            country VARCHAR(255),
+            latitude DOUBLE,
+            longitude DOUBLE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS photo_places (
+            photo_id INT,
+            place_id INT,
+            PRIMARY KEY (photo_id, place_id),
+            FOREIGN KEY (photo_id) REFERENCES Photos(id) ON DELETE CASCADE,
+            FOREIGN KEY (place_id) REFERENCES Places(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS Videos (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            file_name VARCHAR(255),
+            file_location VARCHAR(2048),
+            resolution VARCHAR(50),
+            size BIGINT,
+            latitude DOUBLE,
+            longitude DOUBLE,
+            date_taken DATETIME,
+            camera_make VARCHAR(255),
+            camera_model VARCHAR(255),
+            duration DOUBLE,
+            frame_rate DOUBLE,
+            light_meter VARCHAR(50),
+            lens_id VARCHAR(255),
+            lens_spec VARCHAR(255),
+            circle_of_confusion VARCHAR(50),
+            altitude DOUBLE,
+            shutter_speed VARCHAR(50),
+            aperture VARCHAR(50),
+            iso VARCHAR(50),
+            flash TINYINT(1)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS video_places (
+            video_id INT,
+            place_id INT,
+            PRIMARY KEY (video_id, place_id),
+            FOREIGN KEY (video_id) REFERENCES Videos(id) ON DELETE CASCADE,
+            FOREIGN KEY (place_id) REFERENCES Places(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS GeocodingCache (
+            latitude DOUBLE,
+            longitude DOUBLE,
+            osm_id BIGINT,
+            display_name TEXT,
+            geocoded_at DATETIME,
+            PRIMARY KEY (latitude, longitude)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        """
+    ]
+    for query in tables:
+        try:
+            cursor.execute(query)
+            conn.commit()
+            logger.debug(f"Table created/checked: {query.splitlines()[0].strip()}")
+        except Exception as e: # Catch all exceptions from mysql.connector
+            logger.error(f"Error creating table: {e}\nQuery: {query}")
+            # Consider exiting or handling more gracefully depending on severity
+    cursor.close()
+    logger.info("Database tables checked/created.")
+
+def mark_as_processed(conn, file_path):
+    """
+    Marks a given file path as processed in the MediaProcessing table.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+        file_path (str): The path of the file to mark.
+    """
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO MediaProcessing (file_path, processed, processed_at)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE processed = VALUES(processed), processed_at = VALUES(processed_at)
+        """, (file_path, True, datetime.now())) # Use datetime object directly for DATETIME columns
+        conn.commit()
+        logger.debug(f"Marked {file_path} as processed.")
+    except Exception as e: # Catch all exceptions from mysql.connector
+        conn.rollback()
+        logger.error(f"Error marking {file_path} as processed: {e}")
+    finally:
+        cursor.close()
+
+def is_processed(conn, file_path):
+    """
+    Checks if a given file path has already been processed.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+        file_path (str): The path of the file to check.
+    Returns:
+        bool: True if the file is marked as processed, False otherwise.
+    """
+    cursor = conn.cursor(dictionary=True) # Use dictionary=True for dict-like rows
+    try:
+        # Use a prefix of the file_path for checking the index
+        # Ensure consistency with how the UNIQUE index is defined in create_tables_if_not_exists
+        cursor.execute("SELECT processed FROM MediaProcessing WHERE file_path = %s", (file_path,))
+        result = cursor.fetchone()
+        return result and result['processed']
+    except Exception as e:
+        logger.error(f"Error checking processing status for {file_path}: {e}")
+        return False # Assume not processed on error
+    finally:
+        cursor.close()
+
+def get_or_create_face_id(conn, face_name):
+    """
+    Retrieves the ID for a given face name from the 'faces' table, or creates a new entry if it doesn't exist.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+        face_name (str): The name of the face.
+    Returns:
+        int: The ID of the face in the 'faces' table.
+    Raises:
+        Exception: If there's a persistent error in getting or creating the face ID.
+    """
+    cursor = conn.cursor(dictionary=True) # Use dictionary=True for dict-like rows
+    try:
+        cursor.execute("SELECT id FROM faces WHERE name = %s", (face_name,))
+        result = cursor.fetchone()
+        if result:
+            logger.debug(f"Found existing face ID {result['id']} for '{face_name}'.")
+            return result['id']
+        else:
+            try:
+                cursor.execute("INSERT INTO faces (name) VALUES (%s)", (face_name,))
+                conn.commit()
+                logger.debug(f"Created new face ID {cursor.lastrowid} for '{face_name}'.")
+                return cursor.lastrowid
+            except mysql.connector.IntegrityError as e: # <--- CHANGE THIS LINE
+                # Handle race condition/unique constraint violation
+                conn.rollback() # Rollback the failed insert
+                logger.warning(f"Race condition or integrity error when inserting face '{face_name}': {e}. Retrying select.")
+                cursor.execute("SELECT id FROM faces WHERE name = %s", (face_name,))
+                result = cursor.fetchone()
+                if result:
+                    return result['id']
+                else:
+                    logger.error(f"Failed to get or create face ID for '{face_name}' after retry.")
+                    raise # Re-raise if still no ID, indicating a deeper issue
+            except Exception as e: # Catch other potential errors during insert
+                conn.rollback()
+                logger.error(f"Unexpected error during face insert for '{face_name}': {e}")
+                raise
+    except Exception as e: # Catch all exceptions from mysql.connector
+        conn.rollback()
+        logger.error(f"Error in get_or_create_face_id for {face_name}: {e}")
+        raise # Re-raise to propagate the error
+    finally:
+        cursor.close()
+
+# --- Metadata Extraction Functions (Identical to previous, as they don't touch DB) ---
+def get_exif_data(image_path):
+    """Extracts EXIF data from an image using Pillow."""
+    try:
+        img = Image.open(image_path)
+        exif_data = {}
+        if hasattr(img, '_getexif') and img._getexif():
+            for tag, value in img._getexif().items():
+                decoded = ExifTags.TAGS.get(tag, tag)
+                exif_data[decoded] = value
+        logger.debug(f"Extracted Pillow EXIF data from {image_path}.")
+        return exif_data
+    except Exception as e:
+        logger.debug(f"Error reading EXIF from {image_path} with Pillow: {e}")
+        return {}
+
+def get_exiftool_data(file_path):
+    """Extracts all metadata using exiftool."""
+    try:
+        cmd = ['exiftool', '-j', '-n', file_path] # -n for numerical values for GPS
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        data = json.loads(result.stdout)
+        if data:
+            logger.debug(f"Extracted ExifTool data from {file_path}.")
+            return data[0]
+        logger.debug(f"No ExifTool data found for {file_path}.")
+        return {}
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error running exiftool on {file_path}: {e.stderr}")
+        return {}
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding exiftool JSON output for {file_path}: {e}")
+        return {}
+    except Exception as e:
+        logger.error(f"Unexpected error with exiftool for {file_path}: {e}")
+        return {}
+
+def process_image(conn, file_path):
+    """
+    Processes a single image file, extracts its metadata, and stores/updates it in the 'Photos' table.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+        file_path (str): The path to the image file.
+    Returns:
+        int or None: The ID of the photo in the database, or None if processing failed.
+    """
+    if is_processed(conn, file_path):
+        logger.debug(f"Image {file_path} already processed. Skipping.")
+        return
+
+    logger.info(f"Processing image: {file_path}")
+    file_name = os.path.basename(file_path)
+    file_location = os.path.dirname(file_path)
+
+    metadata = get_exiftool_data(file_path)
+
+    # --- FIX for TypeError: argument of type 'int' is not iterable ---
+    # Handle cases where 'Flash' might be an int or a string
+    flash_status = metadata.get('Flash')
+    flash_int = 0 # Default to 0 (off)
+    if flash_status is not None:
+        if isinstance(flash_status, str):
+            if 'On' in flash_status: # e.g., 'On', 'On (Auto)'
+                flash_int = 1
+        elif isinstance(flash_status, (int, float)):
+            if flash_status > 0: # ExifTool might return 0 for off, >0 for on
+                flash_int = 1
+    # --- END FIX ---
+
+    # Convert date string to datetime object if possible
+    date_taken_str = metadata.get('DateTimeOriginal') or metadata.get('CreateDate') or metadata.get('FileCreateDate')
+    date_taken_dt = None
+    if date_taken_str:
+        try:
+            # Common EXIF date format: "YYYY:MM:DD HH:MM:SS"
+            date_taken_dt = datetime.strptime(date_taken_str, '%Y:%m:%d %H:%M:%S')
+        except ValueError:
+            logger.debug(f"Could not parse date '{date_taken_str}' for {file_path}. Keeping as None.")
+            pass # Try other common formats if needed, or leave as None
+
+
+    photo_data = {
+        'file_name': file_name,
+        'file_location': file_location,
+        'resolution': f"{metadata.get('ImageWidth')}x{metadata.get('ImageHeight')}" if metadata.get('ImageWidth') and metadata.get('ImageHeight') else None,
+        'size': os.path.getsize(file_path),
+        'latitude': metadata.get('GPSLatitude'),
+        'longitude': metadata.get('GPSLongitude'),
+        'altitude': metadata.get('GPSAltitude'),
+        'date_taken': date_taken_dt, # Pass datetime object directly
+        'camera_make': metadata.get('Make'),
+        'camera_model': metadata.get('Model'),
+        'shutter_speed': str(metadata.get('ShutterSpeedValue') or metadata.get('ExposureTime')) if metadata.get('ShutterSpeedValue') or metadata.get('ExposureTime') else None,
+        'aperture': str(metadata.get('FNumber') or metadata.get('ApertureValue')) if metadata.get('FNumber') or metadata.get('ApertureValue') else None,
+        'iso': str(metadata.get('ISO')) if metadata.get('ISO') else None,
+        'flash': flash_int,
+        'light_meter': metadata.get('MeteringMode'),
+        'lens_id': metadata.get('LensID'),
+        'lens_spec': metadata.get('Lens'),
+        'circle_of_confusion': None
+    }
+
+    cursor = conn.cursor(dictionary=True) # Use dictionary=True for dict-like rows
+    try:
+        cursor.execute("SELECT id FROM Photos WHERE file_location = %s AND file_name = %s", (file_location, file_name))
+        photo_id_row = cursor.fetchone()
+
+        if photo_id_row:
+            photo_id = photo_id_row['id']
+            update_query = """
+                UPDATE Photos SET
+                    resolution = %s, size = %s, latitude = %s, longitude = %s, altitude = %s,
+                    date_taken = %s, camera_make = %s, camera_model = %s, shutter_speed = %s,
+                    aperture = %s, iso = %s, flash = %s, light_meter = %s, lens_id = %s,
+                    lens_spec = %s, circle_of_confusion = %s
+                WHERE id = %s
+            """
+            cursor.execute(update_query, (
+                photo_data['resolution'], photo_data['size'], photo_data['latitude'], photo_data['longitude'], photo_data['altitude'],
+                photo_data['date_taken'], photo_data['camera_make'], photo_data['camera_model'], photo_data['shutter_speed'],
+                photo_data['aperture'], photo_data['iso'], photo_data['flash'], photo_data['light_meter'], photo_data['lens_id'],
+                photo_data['lens_spec'], photo_data['circle_of_confusion'], photo_id
+            ))
+            logger.debug(f"Updated photo record for {file_name} (ID: {photo_id}).")
+        else:
+            insert_query = """
+                INSERT INTO Photos (
+                    file_name, file_location, resolution, size, latitude, longitude, altitude,
+                    date_taken, camera_make, camera_model, shutter_speed, aperture, iso,
+                    flash, light_meter, lens_id, lens_spec, circle_of_confusion
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_query, (
+                photo_data['file_name'], photo_data['file_location'], photo_data['resolution'], photo_data['size'],
+                photo_data['latitude'], photo_data['longitude'], photo_data['altitude'], photo_data['date_taken'],
+                photo_data['camera_make'], photo_data['camera_model'], photo_data['shutter_speed'], photo_data['aperture'],
+                photo_data['iso'], photo_data['flash'], photo_data['light_meter'], photo_data['lens_id'],
+                photo_data['lens_spec'], photo_data['circle_of_confusion']
+            ))
+            photo_id = cursor.lastrowid
+            logger.debug(f"Inserted new photo record for {file_name} (ID: {photo_id}).")
+        conn.commit()
+        mark_as_processed(conn, file_path)
+        return photo_id
+    except Exception as e: # Catch all exceptions from mysql.connector
+        conn.rollback() # Rollback on error
+        logger.error(f"Error processing image {file_path}: {e}")
+        return None
+    finally:
+        cursor.close()
+
+def process_video(conn, file_path):
+    """
+    Processes a single video file, extracts its metadata, and stores/updates it in the 'Videos' table.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+        file_path (str): The path to the video file.
+    Returns:
+        int or None: The ID of the video in the database, or None if processing failed.
+    """
+    if is_processed(conn, file_path):
+        logger.debug(f"Video {file_path} already processed. Skipping.")
+        return
+
+    logger.info(f"Processing video: {file_path}")
+    file_name = os.path.basename(file_path)
+    file_location = os.path.dirname(file_path)
+
+    metadata = get_exiftool_data(file_path)
+
+    # --- FIX for TypeError: argument of type 'int' is not iterable ---
+    # Handle cases where 'Flash' might be an int or a string
+    flash_status = metadata.get('Flash')
+    flash_int = 0 # Default to 0 (off)
+    if flash_status is not None:
+        if isinstance(flash_status, str):
+            if 'On' in flash_status: # e.g., 'On', 'On (Auto)'
+                flash_int = 1
+        elif isinstance(flash_status, (int, float)):
+            if flash_status > 0: # ExifTool might return 0 for off, >0 for on
+                flash_int = 1
+    # --- END FIX ---
+
+    # Convert date string to datetime object if possible
+    date_taken_str = metadata.get('CreationDate') or metadata.get('MediaCreateDate') or metadata.get('FileCreateDate')
+    date_taken_dt = None
+    if date_taken_str:
+        try:
+            date_taken_dt = datetime.strptime(date_taken_str, '%Y:%m:%d %H:%M:%S')
+        except ValueError:
+            logger.debug(f"Could not parse date '{date_taken_str}' for {file_path}. Keeping as None.")
+            pass # exiftool sometimes gives a different format, handle as string or None
+
+    video_data = {
+        'file_name': file_name,
+        'file_location': file_location,
+        'resolution': f"{metadata.get('ImageWidth')}x{metadata.get('ImageHeight')}" if metadata.get('ImageWidth') and metadata.get('ImageHeight') else None,
+        'size': os.path.getsize(file_path),
+        'latitude': metadata.get('GPSLatitude'),
+        'longitude': metadata.get('GPSLongitude'),
+        'altitude': metadata.get('GPSAltitude'),
+        'date_taken': date_taken_dt, # Pass datetime object directly
+        'camera_make': metadata.get('Make'),
+        'camera_model': metadata.get('Model'),
+        'duration': metadata.get('Duration'),
+        'frame_rate': metadata.get('FrameRate'),
+        'light_meter': metadata.get('MeteringMode'),
+        'lens_id': metadata.get('LensID'),
+        'lens_spec': metadata.get('Lens'),
+        'circle_of_confusion': None,
+        'shutter_speed': str(metadata.get('ShutterSpeedValue') or metadata.get('ExposureTime')) if metadata.get('ShutterSpeedValue') or metadata.get('ExposureTime') else None,
+        'aperture': str(metadata.get('FNumber') or metadata.get('ApertureValue')) if metadata.get('FNumber') or metadata.get('ApertureValue') else None,
+        'iso': str(metadata.get('ISO')) if metadata.get('ISO') else None,
+        'flash': flash_int
+    }
+
+    cursor = conn.cursor(dictionary=True) # Use dictionary=True for dict-like rows
+    try:
+        cursor.execute("SELECT id FROM Videos WHERE file_location = %s AND file_name = %s", (file_location, file_name))
+        video_id_row = cursor.fetchone()
+
+        if video_id_row:
+            video_id = video_id_row['id']
+            update_query = """
+                UPDATE Videos SET
+                    resolution = %s, size = %s, latitude = %s, longitude = %s, date_taken = %s,
+                    camera_make = %s, camera_model = %s, duration = %s, frame_rate = %s,
+                    light_meter = %s, lens_id = %s, lens_spec = %s, circle_of_confusion = %s,
+                    altitude = %s, shutter_speed = %s, aperture = %s, iso = %s, flash = %s
+                WHERE id = %s
+            """
+            cursor.execute(update_query, (
+                video_data['resolution'], video_data['size'], video_data['latitude'], video_data['longitude'],
+                video_data['date_taken'], video_data['camera_make'], video_data['camera_model'], video_data['duration'],
+                video_data['frame_rate'], video_data['light_meter'], video_data['lens_id'], video_data['lens_spec'],
+                video_data['circle_of_confusion'], video_data['altitude'], video_data['shutter_speed'],
+                video_data['aperture'], video_data['iso'], video_data['flash'], video_id
+            ))
+            logger.debug(f"Updated video record for {file_name} (ID: {video_id}).")
+        else:
+            insert_query = """
+                INSERT INTO Videos (
+                    file_name, file_location, resolution, size, latitude, longitude, date_taken,
+                    camera_make, camera_model, duration, frame_rate, light_meter, lens_id,
+                    lens_spec, circle_of_confusion, altitude, shutter_speed, aperture, iso, flash
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(insert_query, (
+                video_data['file_name'], video_data['file_location'], video_data['resolution'], video_data['size'],
+                video_data['latitude'], video_data['longitude'], video_data['date_taken'], video_data['camera_make'],
+                video_data['camera_model'], video_data['duration'], video_data['frame_rate'], video_data['light_meter'],
+                video_data['lens_id'], video_data['lens_spec'], video_data['circle_of_confusion'],
+                video_data['altitude'], video_data['shutter_speed'], video_data['aperture'], video_data['iso'], video_data['flash']
+            ))
+            video_id = cursor.lastrowid
+            logger.debug(f"Inserted new video record for {file_name} (ID: {video_id}).")
+        conn.commit()
+        mark_as_processed(conn, file_path)
+        return video_id
+    except Exception as e: # Catch all exceptions from mysql.connector
+        conn.rollback()
+        logger.error(f"Error processing video {file_path}: {e}")
+        return None
+    finally:
+        cursor.close()
+
+
+def _batch_insert_photo_faces(conn, batch):
+    """Inserts a batch of photo-face associations into the photo_faces table."""
+    if not batch:
+        return 0
+
+    sql = "INSERT IGNORE INTO photo_faces (photo_id, face_id) VALUES (%s, %s)"
+    cursor = None
+    inserted_count = 0
+    try:
+        cursor = conn.cursor()
+        logger.debug(f"Attempting to insert {len(batch)} photo-face associations into photo_faces. Batch content sample (first 5): {batch[:5]}...")
+        cursor.executemany(sql, batch)
+        inserted_count = cursor.rowcount
+        conn.commit()
+        logger.debug(f"Successfully called executemany and commit for photo_faces. cursor.rowcount reported: {inserted_count}.")
+
+        # --- NEW DEBUGGING STEP: Verify count immediately after commit ---
+        temp_cursor = conn.cursor()
+        temp_cursor.execute("SELECT COUNT(*) FROM photo_faces")
+        current_db_count = temp_cursor.fetchone()[0]
+        temp_cursor.close()
+        logger.debug(f"DEBUG_CHECK: photo_faces table count immediately after commit (from same connection): {current_db_count}")
+        # --- END NEW DEBUGGING STEP ---
+
+    except mysql.connector.Error as err:
+        logger.error(f"MySQL Error inserting photo-face batch: {err}", exc_info=True)
+        conn.rollback() # Rollback on error
+    except Exception as e:
+        logger.error(f"General Error during photo-face batch insert: {e}", exc_info=True) # Use exc_info=True for full traceback
+        conn.rollback()
+    finally:
+        if cursor:
+            cursor.close()
+    return inserted_count
+
+def _batch_insert_video_faces(conn, batch):
+    """Inserts a batch of video-face associations into the video_faces table."""
+    if not batch:
+        return 0
+
+    sql = "INSERT IGNORE INTO video_faces (video_id, face_id, frame_number) VALUES (%s, %s, %s)"
+    cursor = None
+    inserted_count = 0
+    try:
+        cursor = conn.cursor()
+        logger.debug(f"Attempting to insert {len(batch)} video-face associations into video_faces. Batch content sample (first 5): {batch[:5]}...")
+        cursor.executemany(sql, batch)
+        inserted_count = cursor.rowcount
+        conn.commit()
+        logger.debug(f"Successfully called executemany and commit for video_faces. cursor.rowcount reported: {inserted_count}.")
+
+        # --- NEW DEBUGGING STEP: Verify count immediately after commit ---
+        temp_cursor = conn.cursor()
+        temp_cursor.execute("SELECT COUNT(*) FROM video_faces")
+        current_db_count = temp_cursor.fetchone()[0]
+        temp_cursor.close()
+        logger.debug(f"DEBUG_CHECK: video_faces table count immediately after commit (from same connection): {current_db_count}")
+        # --- END NEW DEBUGGING STEP ---
+
+    except mysql.connector.Error as err:
+        logger.error(f"MySQL Error inserting video-face batch: {err}", exc_info=True)
+        conn.rollback() # Rollback on error
+    except Exception as e:
+        logger.error(f"General Error during video-face batch insert: {e}", exc_info=True) # Use exc_info=True for full traceback
+        conn.rollback()
+    finally:
+        if cursor:
+            cursor.close()
+    return inserted_count
+
+
+def process_google_takeout(conn, batch_size=100):
+    """
+    Processes Google Takeout JSON files to extract face information and associate it with media.
+    Uses grep to pre-filter JSONs likely to contain 'people' data.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+        batch_size (int): The number of face associations to insert in one batch.
+    """
+    logger.info("--- Phase 2: Processing Google Takeout Data for Faces ---")
+    
+    if not os.path.exists(GOOGLE_TAKEOUT_ROOT_DIR):
+        logger.warning(f"Google Takeout root directory '{GOOGLE_TAKEOUT_ROOT_DIR}' does not exist. Skipping Google Takeout processing.")
+        return
+
+    takeout_json_files = []
+    
+    # --- RE-INTEGRATED: Use grep to get a filtered list of JSON files, searching for "people" ---
+    # The -l option ensures only filenames are listed. -i for case-insensitivity. -R for recursive.
+    grep_command = f"grep -l -i \"people\" \"{GOOGLE_TAKEOUT_ROOT_DIR}\" --include='*.json' -R"
+    
+    logger.info(f"Using grep to identify relevant JSON files: {grep_command}")
+    try:
+        # Use shlex.split for safe splitting of the command string with spaces/quotes
+        process = subprocess.run(shlex.split(grep_command), capture_output=True, text=True, check=True)
+        
+        for line in process.stdout.splitlines():
+            json_path = line.strip()
+            if json_path: # Ensure line is not empty
+                takeout_json_files.append(json_path)
+        
+        logger.info(f"grep identified {len(takeout_json_files)} potential media JSONs with 'people' data.")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Error running grep command: {e}")
+        logger.error(f"grep stderr: {e.stderr}")
+        logger.warning("Falling back to full file system walk for Google Takeout JSONs (less efficient).")
+        # Fallback to os.walk if grep fails (e.g., command not found, permissions)
+        for root, _, files in os.walk(GOOGLE_TAKEOUT_ROOT_DIR):
+            for file in files:
+                if file.lower().endswith('.json') and not file.lower().startswith('album_'):
+                    takeout_json_files.append(os.path.join(root, file))
+    except FileNotFoundError:
+        logger.error("grep command not found. Ensure grep is installed and in your system's PATH.")
+        logger.warning("Falling back to full file system walk for Google Takeout JSONs (less efficient).")
+        for root, _, files in os.walk(GOOGLE_TAKEOUT_ROOT_DIR):
+            for file in files:
+                if file.lower().endswith('.json') and not file.lower().startswith('album_'):
+                    takeout_json_files.append(os.path.join(root, file))
+    # --- END: GREP RE-INTEGRATION ---
+
+
+    if not takeout_json_files:
+        logger.info(f"No relevant Google Takeout JSON files found after filtering or in '{GOOGLE_TAKEOUT_ROOT_DIR}'. Please ensure 'GOOGLE_TAKEOUT_ROOT_DIR' is correctly set and contains JSON files with 'people' data or titles.")
+        return
+
+    photo_face_batch = []
+    video_face_batch = []
+    processed_json_with_people_data_count = 0 # Count of JSONs that actually had 'people' data and a media ID match
+
+    for json_file_path in tqdm(takeout_json_files, desc="Processing Takeout JSONs"):
+        cursor = None
+        try:
+            with open(json_file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            media_filename = data.get('title')
+
+            if not media_filename:
+                logger.debug(f"Skipping JSON {json_file_path}: No 'title' (media filename) found.")
+                continue
+
+            # --- UPDATED: Use fuzzy date matching again as it was working for D70_1769.NEF ---
+            photo_taken_time_data = data.get('photoTakenTime')
+            if not photo_taken_time_data or 'timestamp' not in photo_taken_time_data:
+                logger.debug(f"Skipping JSON {json_file_path}: No 'photoTakenTime' or 'timestamp'.")
+                continue
+
+            try:
+                json_timestamp_int = int(photo_taken_time_data['timestamp'])
+                json_datetime_from_takeout = datetime.fromtimestamp(json_timestamp_int)
+
+                time_window_hours = 3 # Define your time window for fuzzy matching
+                start_time = json_datetime_from_takeout - timedelta(hours=time_window_hours)
+                end_time = json_datetime_from_takeout + timedelta(hours=time_window_hours)
+
+            except (ValueError, TypeError) as e:
+                logger.error(f"Could not parse photoTakenTime timestamp from JSON {json_file_path}: {e}. Skipping.")
+                continue
+
+            media_id = None
+            media_type = None
+            base_media_filename = os.path.splitext(media_filename)[0]
+
+            cursor = conn.cursor(dictionary=True)
+
+            if media_filename.lower().endswith(tuple(IMAGE_EXTENSIONS)):
+                query = """
+                SELECT id FROM Photos
+                WHERE file_name LIKE %s AND date_taken BETWEEN %s AND %s
+                ORDER BY ABS(UNIX_TIMESTAMP(date_taken) - %s)
+                LIMIT 1
+                """
+                cursor.execute(query, (f"{base_media_filename}%", start_time, end_time, json_timestamp_int))
+                photo_match = cursor.fetchone()
+                if photo_match:
+                    media_id = photo_match['id']
+                    media_type = 'photo'
+                # Do NOT call process_image here if it's not found, as --only-takeout implies we only process linked Takeout media,
+                # which must exist from a prior local scan. If it's not in the DB, it can't be linked.
+            elif media_filename.lower().endswith(tuple(VIDEO_EXTENSIONS)):
+                query = """
+                SELECT id FROM Videos
+                WHERE file_name LIKE %s AND date_taken BETWEEN %s AND %s
+                ORDER BY ABS(UNIX_TIMESTAMP(date_taken) - %s)
+                LIMIT 1
+                """
+                cursor.execute(query, (f"{base_media_filename}%", start_time, end_time, json_timestamp_int))
+                video_match = cursor.fetchone()
+                if video_match:
+                    media_id = video_match['id']
+                    media_type = 'video'
+                # Do NOT call process_video here if it's not found
+            else:
+                logger.debug(f"Skipping JSON {json_file_path}: Media file '{media_filename}' is not a recognized image or video type.")
+                continue
+            # --- END OF FUZZY DATE MATCHING ---
+
+            if not media_id:
+                logger.debug(f"Skipping JSON {json_file_path}: Media file '{media_filename}' (base: '{base_media_filename}') not found in Photos or Videos table within date range.")
+                continue
+
+            if 'people' in data and data['people']: # Check if 'people' key exists and is not empty
+                for person_data in data['people']:
+                    person_name = person_data.get('name')
+                    if person_name:
+                        face_id = get_or_create_face_id(conn, person_name) 
+                        if face_id: # Ensure face_id was successfully obtained
+                            if media_type == 'photo':
+                                photo_face_batch.append((media_id, face_id))
+                                logger.debug(f"Queued photo-face association for '{person_name}' (ID: {face_id}) with media ID {media_id}. Current photo_face_batch size: {len(photo_face_batch)}")
+                            elif media_type == 'video':
+                                video_face_batch.append((media_id, face_id, 0)) # Assuming frame_number 0 for now
+                                logger.debug(f"Queued video-face association for '{person_name}' (ID: {face_id}) with media ID {media_id}. Current video_face_batch size: {len(video_face_batch)}")
+
+                        # Batch insert check *inside* the person loop (so it checks after each person is added)
+                        if len(photo_face_batch) >= batch_size:
+                            _batch_insert_photo_faces(conn, photo_face_batch)
+                            photo_face_batch = []
+                        if len(video_face_batch) >= batch_size:
+                            _batch_insert_video_faces(conn, video_face_batch)
+                            video_face_batch = []
+                    else:
+                        logger.debug(f"Skipping person in JSON {json_file_path}: 'name' not found in person data: {person_data}")
+                processed_json_with_people_data_count += 1 
+            else:
+                logger.debug(f"Skipping JSON {json_file_path}: No 'people' data found or 'people' array is empty.")
+
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON file {json_file_path}: {e}")
+        except Exception as e:
+            logger.error(f"An unexpected error occurred while processing {json_file_path}: {e}", exc_info=True)
+        finally:
+            if cursor:
+                cursor.close()
+
+    # Insert any remaining items in the batches
+    if photo_face_batch:
+        _batch_insert_photo_faces(conn, photo_face_batch)
+    if video_face_batch:
+        _batch_insert_video_faces(conn, video_face_batch)
+
+    logger.info(f"Finished processing Google Takeout data. Processed {processed_json_with_people_data_count} media JSONs that had associated face data.")
+
+def get_or_create_place_id(conn, lat, lon, nominatim_data):
+    """
+    Retrieves the ID for a given place from the 'Places' table, or creates a new entry.
+    Uses GeocodingCache to avoid redundant API calls.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+        lat (float): Latitude.
+        lon (float): Longitude.
+        nominatim_data (dict): The parsed JSON response from Nominatim for this coordinate.
+    Returns:
+        int: The ID of the place in the 'Places' table.
+    """
+    cursor = conn.cursor(dictionary=True)
+    place_id = None
+    
+    try:
+        # 1. Check GeocodingCache first
+        cursor.execute("SELECT osm_id, display_name FROM GeocodingCache WHERE latitude = %s AND longitude = %s", (lat, lon))
+        cached_result = cursor.fetchone()
+
+        if cached_result:
+            logger.debug(f"Found cached geocoding for {lat},{lon}.")
+            # If found in cache, ensure it's also in Places table
+            cursor.execute("SELECT id FROM Places WHERE osm_id = %s", (cached_result['osm_id'],))
+            place_row = cursor.fetchone()
+            if place_row:
+                place_id = place_row['id']
+            else:
+                # This scenario should be rare if cache and places are consistent, but handle it
+                logger.warning(f"Cached OSM ID {cached_result['osm_id']} not found in Places table. Re-inserting.")
+                # Fall through to insert logic below using cached_result data
+                nominatim_data = {
+                    'osm_id': cached_result['osm_id'],
+                    'osm_type': 'cached', # Indicate it came from cache, type might be unknown
+                    'display_name': cached_result['display_name'],
+                    'address': {
+                        'city': None, 'state': None, 'country': None # Placeholder, cache might not store these
+                    }
+                }
+                # Attempt to parse city/state/country from display_name if possible, or leave None
+                parts = cached_result['display_name'].split(', ')
+                if len(parts) >= 3:
+                    nominatim_data['address']['country'] = parts[-1]
+                    nominatim_data['address']['state'] = parts[-2]
+                    nominatim_data['address']['city'] = parts[-3]
+        else:
+            # 2. If not in cache, we must have just called Nominatim, so use nominatim_data
+            pass # nominatim_data is already available from the caller
+
+        # If place_id is still None (not found in cache or cache inconsistent), insert into Places
+        if place_id is None:
+            osm_id = nominatim_data.get('osm_id')
+            display_name = nominatim_data.get('display_name')
+            osm_type = nominatim_data.get('osm_type')
+            address = nominatim_data.get('address', {})
+            city = address.get('city') or address.get('town') or address.get('village')
+            state = address.get('state')
+            country = address.get('country')
+
+            try:
+                cursor.execute("""
+                    INSERT INTO Places (osm_id, osm_type, display_name, city, state, country, latitude, longitude)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        osm_type = VALUES(osm_type), display_name = VALUES(display_name),
+                        city = VALUES(city), state = VALUES(state), country = VALUES(country),
+                        latitude = VALUES(latitude), longitude = VALUES(longitude)
+                """, (osm_id, osm_type, display_name, city, state, country, lat, lon))
+                conn.commit()
+                place_id = cursor.lastrowid
+                logger.debug(f"Inserted/Updated place record for '{display_name}' (ID: {place_id}).")
+            except Exception as e:
+                conn.rollback()
+                logger.warning(f"Race condition or integrity error when inserting place '{display_name}': {e}. Retrying select.")
+                # If it was a duplicate key error, fetch the existing ID
+                cursor.execute("SELECT id FROM Places WHERE osm_id = %s", (osm_id,))
+                result = cursor.fetchone()
+                if result:
+                    place_id = result['id']
+                else:
+                    logger.error(f"Failed to get or create place ID for '{display_name}' after retry.")
+                    raise
+
+        # 3. Update GeocodingCache (or insert if not present)
+        cursor.execute("""
+            INSERT INTO GeocodingCache (latitude, longitude, osm_id, display_name, geocoded_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                osm_id = VALUES(osm_id), display_name = VALUES(display_name), geocoded_at = VALUES(geocoded_at)
+        """, (lat, lon, nominatim_data.get('osm_id'), nominatim_data.get('display_name'), datetime.now()))
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error in get_or_create_place_id for {lat},{lon}: {e}")
+        raise
+    finally:
+        cursor.close()
+    return place_id
+
+last_nominatim_request_time = 0
+
+def reverse_geocode_coordinates(lat, lon):
+    """
+    Performs reverse geocoding using Nominatim API.
+    Implements rate limiting and returns parsed JSON data.
+    Args:
+        lat (float): Latitude.
+        lon (float): Longitude.
+    Returns:
+        dict or None: Parsed JSON response from Nominatim, or None on error.
+    """
+    global last_nominatim_request_time
+
+    # Rate limiting
+    time_since_last_request = time.time() - last_nominatim_request_time
+    if time_since_last_request < NOMINATIM_DELAY_SECONDS:
+        sleep_time = NOMINATIM_DELAY_SECONDS - time_since_last_request
+        logger.debug(f"Rate limiting: Sleeping for {sleep_time:.2f} seconds before next Nominatim request.")
+        time.sleep(sleep_time)
+
+    params = {
+        'lat': lat,
+        'lon': lon,
+        'format': 'json',
+        'addressdetails': 1 # Request detailed address components
+    }
+    headers = {
+        'User-Agent': NOMINATIM_USER_AGENT
+    }
+
+    try:
+        logger.debug(f"Querying Nominatim for {lat},{lon}...")
+        response = requests.get(NOMINATIM_API_URL, params=params, headers=headers, timeout=10)
+        last_nominatim_request_time = time.time() # Update last request time immediately after sending
+        response.raise_for_status() # Raise an HTTPError for bad responses (4xx or 5xx)
+        data = response.json()
+        
+        if data and data.get('osm_id'):
+            logger.debug(f"Nominatim response for {lat},{lon}: {data.get('display_name')}")
+            return data
+        else:
+            logger.warning(f"Nominatim returned no valid result for {lat},{lon}: {data}")
+            return None
+    except requests.exceptions.Timeout:
+        logger.error(f"Nominatim request timed out for {lat},{lon}.")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error querying Nominatim for {lat},{lon}: {e}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding Nominatim JSON response for {lat},{lon}: {e}")
+        return None
+
+def process_places(conn):
+    """
+    Processes media files with GPS coordinates to perform reverse geocoding
+    and populate the Places and photo_places/video_places tables.
+    Args:
+        conn (mysql.connector.connection.MySQLConnection): The database connection object.
+    """
+    logger.info("--- Phase 3: Reverse Geocoding for Places ---")
+    
+    cursor = conn.cursor(dictionary=True)
+    
+    # Collect unique (latitude, longitude) pairs from Photos and Videos that haven't been geocoded
+    # and are not yet linked to a place.
+    # This query needs to be carefully constructed to be efficient.
+    
+    # Find unique lat/lon from Photos not yet in GeocodingCache
+    photos_to_geocode_query = """
+        SELECT DISTINCT p.latitude, p.longitude
+        FROM Photos p
+        LEFT JOIN GeocodingCache gc ON p.latitude = gc.latitude AND p.longitude = gc.longitude
+        WHERE p.latitude IS NOT NULL AND p.longitude IS NOT NULL AND gc.latitude IS NULL;
+    """
+    
+    # Find unique lat/lon from Videos not yet in GeocodingCache
+    videos_to_geocode_query = """
+        SELECT DISTINCT v.latitude, v.longitude
+        FROM Videos v
+        LEFT JOIN GeocodingCache gc ON v.latitude = gc.latitude AND v.longitude = gc.longitude
+        WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL AND gc.latitude IS NULL;
+    """
+    
+    unique_coords_to_geocode = set()
+
+    try:
+        cursor.execute(photos_to_geocode_query)
+        for row in cursor.fetchall():
+            unique_coords_to_geocode.add((row['latitude'], row['longitude']))
+
+        cursor.execute(videos_to_geocode_query)
+        for row in cursor.fetchall():
+            unique_coords_to_geocode.add((row['latitude'], row['longitude']))
+    except Exception as e:
+        logger.error(f"Error collecting coordinates for geocoding: {e}")
+        cursor.close()
+        return
+    finally:
+        cursor.close() # Close cursor after fetching all coordinates
+
+    if not unique_coords_to_geocode:
+        logger.info("No new unique coordinates found for geocoding.")
+        return
+
+    logger.info(f"Found {len(unique_coords_to_geocode)} unique coordinates to geocode.")
+
+    # Process each unique coordinate
+    for lat, lon in tqdm(unique_coords_to_geocode, desc="Geocoding unique coordinates"):
+        nominatim_data = reverse_geocode_coordinates(lat, lon)
+        if nominatim_data:
+            try:
+                place_id = get_or_create_place_id(conn, lat, lon, nominatim_data)
+                if place_id:
+                    # Now link media files to this place_id
+                    link_cursor = conn.cursor()
+                    
+                    # Link Photos
+                    link_cursor.execute("""
+                        INSERT IGNORE INTO photo_places (photo_id, place_id)
+                        SELECT id, %s FROM Photos
+                        WHERE latitude = %s AND longitude = %s
+                    """, (place_id, lat, lon))
+                    
+                    # Link Videos
+                    link_cursor.execute("""
+                        INSERT IGNORE INTO video_places (video_id, place_id)
+                        SELECT id, %s FROM Videos
+                        WHERE latitude = %s AND longitude = %s
+                    """, (place_id, lat, lon))
+                    
+                    conn.commit()
+                    link_cursor.close()
+                    logger.debug(f"Linked media to place ID {place_id} for {lat},{lon}.")
+                else:
+                    logger.warning(f"Could not get or create place ID for {lat},{lon}. Skipping linking.")
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Error linking media to place for {lat},{lon}: {e}")
+        else:
+            logger.warning(f"Failed to geocode coordinates {lat},{lon}. Skipping.")
+    
+    logger.info("Finished reverse geocoding for places.")
+
+# ... (your existing imports and other functions) ...
+
+# --- Main Logic ---
+def main():
+    parser = argparse.ArgumentParser(description="Process media files and store metadata.")
+    parser.add_argument("--config", default=os.path.expanduser("~/.my.cnf"),
+                        help="Path to the MySQL .cnf configuration file (default: ~/.my.cnf)")
+    parser.add_argument("--section", default=None,
+                        help="Section in the .cnf file to use for database connection (default: 'client' or first section)")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("--takeout-batch-size", type=int, default=100,
+                        help="Batch size for inserting face associations from Google Takeout (default: 100).")
+    # ADD THIS LINE for --only-takeout
+    parser.add_argument("--only-takeout", action="store_true",
+                        help="Only process Google Takeout data; skip local media scanning.")
+
+
+    args = parser.parse_args()
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled.")
+
+    logger.debug("Attempting to connect to the database...")
+    conn = connect_db(args.config, args.section)
+    logger.debug("Database connection established. Attempting to create/check tables...")
+    create_tables_if_not_exists(conn)
+    logger.debug("Tables created/checked. Starting file system scan for media directories...")
+
+    # Conditional execution based on --only-takeout
+    if not args.only_takeout: # Only run local media processing if --only-takeout is NOT present
+        logger.info("--- Phase 1: Extracting metadata from local files ---")
+        files_to_process = []
+
+        # Check if PHOTO_DIR exists before walking it
+        if not os.path.exists(PHOTO_DIR):
+            logger.warning(f"Media directory '{PHOTO_DIR}' does not exist. Skipping local photo scan.")
+        else:
+            for root, _, files in os.walk(PHOTO_DIR):
+                for file in files:
+                    if file.lower().endswith(tuple(IMAGE_EXTENSIONS)):
+                        files_to_process.append(os.path.join(root, file))
+
+        # Check if VIDEO_DIR exists before walking it
+        if not os.path.exists(VIDEO_DIR):
+            logger.warning(f"Media directory '{VIDEO_DIR}' does not exist. Skipping local video scan.")
+        else:
+            for root, _, files in os.walk(VIDEO_DIR):
+                for file in files:
+                    if file.lower().endswith(tuple(VIDEO_EXTENSIONS)):
+                        files_to_process.append(os.path.join(root, file))
+
+        total_potential_files = len(files_to_process)
+        logger.debug(f"Finished initial file system scan. Found {total_potential_files} potential media files.")
+
+        # Filter out already processed files
+        new_files_to_process = []
+        logger.info(f"Scanning {total_potential_files} potential media files to check processing status...")
+        with tqdm(total=total_potential_files, desc="Checking processing status", unit="file") as pbar:
+            for file_path in files_to_process:
+                if not is_processed(conn, file_path):
+                    new_files_to_process.append(file_path)
+                pbar.update(1)
+
+        if not new_files_to_process:
+            logger.info("No new files found to process in local media directories.")
+        else:
+            logger.info(f"Found {len(new_files_to_process)} new files to process.")
+            for file_path in tqdm(new_files_to_process, desc="Processing local media"):
+                if file_path.lower().endswith(tuple(IMAGE_EXTENSIONS)):
+                    process_image(conn, file_path)
+                elif file_path.lower().endswith(tuple(VIDEO_EXTENSIONS)):
+                    process_video(conn, file_path)
+        logger.info("Finished processing local media files.")
+    else:
+        logger.info("Skipping local media processing as --only-takeout was specified.")
+
+
+    # This part always runs, regardless of --only-takeout
+    logger.debug("Starting Google Takeout data processing...")
+    process_google_takeout(conn, batch_size=args.takeout_batch_size)
+
+    conn.close()
+    logger.info("\n--- Script finished. ---")
+
+if __name__ == "__main__":
+    main()
+
+

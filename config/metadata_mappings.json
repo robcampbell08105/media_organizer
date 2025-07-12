@@ -1,0 +1,24 @@
+{
+  "Videos": {
+	"FileName": "file_name",
+	"Directory": "file_location",
+    "CreateDate": "date_taken",
+    "ImageSize": "resolution",
+    "FileSize": "size",
+    "Make": "camera_make",
+    "Model": "camera_model",
+    "Duration": "duration",
+    "FrameRate": "frame_rate",
+    "VideoFrameRate": "frame_rate",
+    "LightMeter": "light_meter",
+    "LensID": "lens_id",
+    "LensSpec": "lens_spec",
+    "CircleOfConfusion": "circle_of_confusion",
+    "Altitude": "altitude",
+    "ShutterSpeed": "shutter_speed",
+    "Aperture": "aperture",
+    "ISO": "iso",
+    "Flash": "flash"
+  }
+}
+
