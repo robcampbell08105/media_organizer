@@ -18,17 +18,7 @@ from utils.media_utils import (
     update_missing_media_fields
 )
 from utils.file_mover import move_file
-
-if media_type == "Videos":
-    if is_tiktok(file_path):
-        move_file(file_path, local_tiktok_dir, dry_run)
-        move_file(file_path, remote_tiktok_dir, dry_run)
-    elif "Novatek" in file_path:
-        move_file(file_path, local_dashcam_dir, dry_run)
-        move_file(file_path, remote_dashcam_dir, dry_run)
-    else:
-        move_file(file_path, local_videos_dir, dry_run)
-        move_file(file_path, remote_videos_dir, dry_run)
+from utils.file_mover import process_sources
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -131,16 +121,17 @@ def process_media_files(logger, source_dirs, valid_exts, db_conn,
     total_files = len(media_files)
     logger.info(f"[{media_type}] Total files: {total_files}")
 
-    if is_processed(db_conn, file_path):
-        logger.debug(f"{file_path} already processed. Skipping.")
-        continue
-
     updated = skipped = inserted = unmatched = 0
     batch_limit = 10
     insert_batch = []
     update_batch = []
 
     for idx, file_path in enumerate(media_files, 1):
+        if is_processed(db_conn, file_path, media_type):
+            logger.debug(f"{file_path} already processed. Skipping.")
+            skipped += 1
+            continue
+
         prefix = f"[{media_type}] [{idx}/{total_files}]"
         logger.info(f"{prefix} Processing: {file_path}" if verbose else f"{prefix}")
 
@@ -205,37 +196,68 @@ def handle_media(logger, media_type, source_dirs, ext_set,
 
 def main():
     parser = argparse.ArgumentParser(description="Unified Media Manager")
-    parser.add_argument("--videos", action="store_true")
-    parser.add_argument("--photos", action="store_true")
-    parser.add_argument("--all", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--videos", action="store_true", help="Process video files")
+    parser.add_argument("--photos", action="store_true", help="Process photo files")
+    parser.add_argument("--all", action="store_true", help="Process all media types")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate actions without writing to DB or moving files")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--move-only", action="store_true", help="Only move files, skip database ingest entirely")
+    parser.add_argument("--sources", nargs="+", help="Specify one or more source directories to move files from")
+    parser.add_argument("--target", choices=["local", "remote", "both"], default="local", help="Where to move files")
     args = parser.parse_args()
 
+    # Initialize logging
     logger = setup_logging("media_manager")
     debug = args.debug or args.dry_run
     verbose = args.verbose or args.dry_run
     if debug:
         logger.setLevel(logging.DEBUG)
 
-    try:
-        config_file = os.path.expanduser("~/.my.cnf")
-        config_section = "media"
+    config_file = os.path.expanduser("~/.my.cnf")
+    config_section = "media"
+    db_conn = None if args.dry_run else connect_to_database(config_file, config_section)
 
+    # MOVE-ONLY mode
+    if args.move_only:
+        print("\n🔄 Move-only mode activated.")
+        from utils.file_mover import pick_sources_interactively, process_sources
+        sources = args.sources or pick_sources_interactively()
+        if not sources:
+            print("No sources selected. Exiting.")
+            sys.exit(0)
+
+        process_sources(
+            sources=sources,
+            mode=args.target,
+            dry_run=args.dry_run,
+            verbose=verbose,
+            debug=debug,
+            db_conn=db_conn
+        )
+        sys.exit(0)
+
+    # Full media ingest mode
+    try:
         if args.all or args.videos:
             handle_media(logger, "Videos",
                          ["/multimedia/Videos", "/multimedia/Home_Videos", "/multimedia/TikTok"],
                          VIDEO_EXTS,
-                         dry_run=args.dry_run, debug=debug, verbose=verbose,
-                         config_file=config_file, config_section=config_section)
+                         dry_run=args.dry_run,
+                         debug=debug,
+                         verbose=verbose,
+                         config_file=config_file,
+                         config_section=config_section)
 
         if args.all or args.photos:
             handle_media(logger, "Photos",
                          ["/multimedia/Photos"],
                          IMAGE_EXTS,
-                         dry_run=args.dry_run, debug=debug, verbose=verbose,
-                         config_file=config_file, config_section=config_section)
+                         dry_run=args.dry_run,
+                         debug=debug,
+                         verbose=verbose,
+                         config_file=config_file,
+                         config_section=config_section)
 
     except Exception as e:
         app_failed("media_manager", f"Fatal error: {e}")

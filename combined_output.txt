@@ -1,3 +1,1545 @@
+--- Content of ./utils/file_mover.py ---
+import os
+import re
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+# Import db-backed processor skip logic if needed
+from db_connection import is_processed  # Optional â€” depends on integration
+
+def extract_create_date(file_path):
+    file_name = os.path.basename(file_path)
+
+    # PXL fallback from filename
+    pxl_match = re.match(r"PXL_(\d{6})_", file_name)
+    if pxl_match:
+        try:
+            ts = "20" + pxl_match.group(1)
+            return datetime.strptime(ts, "%Y%m%d").date()
+        except Exception:
+            pass
+
+    # ExifTool fallback
+    try:
+        result = subprocess.run(["exiftool", "-CreateDate", file_path],
+                                capture_output=True, text=True, check=True)
+        line = result.stdout.strip().split(": ", 1)[-1].split()[0]
+        cleaned = line.replace(":", "-", 2)
+        return datetime.strptime(cleaned, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+def is_tiktok(file_path):
+    base = os.path.basename(file_path)
+    return len(base) == 32 and base.isalnum()
+
+def move_file(file_path, target_base, dry_run=False, verbose=False):
+    date = extract_create_date(file_path)
+    if not date:
+        if verbose: print(f"[SKIP] No date found: {file_path}")
+        return
+
+    target_dir = Path(target_base) / str(date)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    filename = os.path.basename(file_path)
+    target_file = target_dir / filename
+
+    if target_file.exists():
+        if verbose: print(f"[SKIP] Already exists in {target_dir}: {filename}")
+        return
+
+    rsync_cmd = ["rsync", "-rltD"]
+    if not dry_run:
+        rsync_cmd.append("--remove-source-files")
+    rsync_cmd += [file_path, str(target_dir)]
+
+    print(f"{'[DRY_RUN]' if dry_run else '[MOVE]'} {file_path} â†’ {target_dir}")
+    subprocess.run(rsync_cmd)
+
+    if not dry_run:
+        subprocess.run(["exiftool",
+                        f"-CreateDate={date}", f"-ModifyDate={date}", f"-DateTimeOriginal={date}",
+                        "-overwrite_original", str(target_file)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["touch", "-d", str(date), str(target_file)])
+
+def pick_sources_interactively(base_dirs=None):
+    base_dirs = base_dirs or ["/mnt", str(Path.home() / "mnt"), "/media", "/run/media"]
+    candidates = []
+
+    for base in base_dirs:
+        if os.path.exists(base):
+            for entry in os.listdir(base):
+                full_path = os.path.join(base, entry)
+                if os.path.isdir(full_path):
+                    candidates.append(full_path)
+
+    if not candidates:
+        print("No candidate media sources found.")
+        return []
+
+    print("\nğŸ“ Found the following media source directories:")
+    for i, path in enumerate(candidates, 1):
+        print(f"  [{i}] {path}")
+
+    choice = input("\nSelect one or more sources (e.g. 1 3 5 or press Enter to skip): ").strip()
+    if not choice:
+        return []
+
+    selected = []
+    try:
+        indexes = [int(i) for i in choice.split()]
+        for i in indexes:
+            if 1 <= i <= len(candidates):
+                selected.append(candidates[i - 1])
+    except Exception:
+        print("Invalid input. No sources selected.")
+        return []
+
+    return selected
+
+def resolve_target(file_path, mode="local"):
+    home = Path.home()
+    remote_base = Path("/multimedia")
+
+    if is_tiktok(file_path):
+        return {
+            "local": home / "Videos" / "TikTok",
+            "remote": remote_base / "videos" / "TikTok"
+        }.get(mode)
+
+    if "Novatek" in file_path or "CARDV" in file_path or "DASHCAM" in file_path:
+        return {
+            "local": home / "Videos" / "DC",
+            "remote": remote_base / "videos" / "DC"
+        }.get(mode)
+
+    if re.search(r"\.(jpg|jpeg|png|gif|heic|tif|tiff|nef|dng|raw)$", file_path, re.IGNORECASE):
+        return {
+            "local": home / "Pictures",
+            "remote": remote_base / "photos"
+        }.get(mode)
+
+    if re.search(r"\.(mp4|mov|avi|mkv|webm|3gp|mpeg|mpg)$", file_path, re.IGNORECASE):
+        return {
+            "local": home / "Videos",
+            "remote": remote_base / "videos"
+        }.get(mode)
+
+    return None
+
+def process_sources(sources, mode="local", dry_run=False, verbose=False, debug=False, db_conn=None):
+    if not sources:
+        print("No media sources provided.")
+        return
+
+    for source in sources:
+        print(f"\nğŸ” Scanning: {source}")
+        for root, _, files in os.walk(source):
+            for name in files:
+                file_path = os.path.join(root, name)
+
+                if ".thumbnail" in file_path or ".thumbnails" in file_path:
+                    if verbose: print(f"[SKIP] Thumbnail file: {file_path}")
+                    continue
+
+                if db_conn and is_processed(db_conn, file_path):
+                    if verbose: print(f"[SKIP] Already processed: {file_path}")
+                    continue
+
+                target = resolve_target(file_path, mode=mode)
+                if not target:
+                    if debug: print(f"[SKIP] Unknown target for: {file_path}")
+                    continue
+
+                move_file(file_path, target, dry_run=dry_run, verbose=verbose)
+
+
+--- Content of ./utils/media_utils.py ---
+# utils/media_utils.py
+
+import os
+import re
+from datetime import datetime
+from db_connection import safe_query as execute_query
+from app_utils import load_metadata_mappings
+import logger
+
+MAPPINGS = load_metadata_mappings()
+
+def get_existing_media_record(db_conn, file_name, media_type, logger):
+    try:
+        logger.debug("Using context-managed cursor to fetch existing record")
+        query = f"SELECT * FROM {media_type} WHERE file_name = %s"
+        with db_conn.cursor(buffered=True) as cursor:
+            cursor.execute(query, (file_name,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            column_names = [desc[0] for desc in cursor.description]  # â† MOVE THIS HERE
+            return dict(zip(column_names, row))                      # â† AND THIS
+    except Exception as e:
+        logger.error(f"Failed to fetch record for {file_name}: {e}")
+        return None
+
+def sanitize_metadata(raw_metadata, mapping, logger, file_path=None):
+    clean = {}
+    logger.debug(f"Raw metadata received: {raw_metadata}")
+    logger.debug(f"Mapped fields: {mapping}")
+
+    for exif_key, db_field in mapping.items():
+        raw_value = raw_metadata.get(exif_key)
+        if raw_value in ("", None, "0000:00:00 00:00:00", "N/A"):
+            continue
+
+        logger.debug(f"Sanitizing: {exif_key} â†’ {db_field} with raw value: {raw_value}")
+        try:
+            value = raw_value
+
+            if db_field == "date_taken":
+                if isinstance(value, datetime):
+                    pass  # already valid
+                else:
+                    value_str = str(value).strip().replace(":", "-", 2)
+                    value = datetime.strptime(value_str[:19], "%Y-%m-%d %H:%M:%S")
+
+            elif db_field == "flash":
+                value = 1 if str(value).lower().strip() in {"yes", "true", "1", "on"} else 0
+
+            elif db_field == "duration":
+                match = re.search(r"(\d+):(\d+):(\d+)", str(value))
+                if match:
+                    h, m, s = map(int, match.groups())
+                    value = h * 3600 + m * 60 + s
+                else:
+                    match = re.search(r"(\d+):(\d+)", str(value))
+                    if match:
+                        m, s = map(int, match.groups())
+                        value = m * 60 + s
+                    elif re.match(r"^\d+(\.\d+)?$", str(value)):
+                        value = float(value)
+
+            elif db_field == "size":
+                match = re.match(r"([\d\.]+)\s*(MB|GB|KB|B)", str(value).strip(), re.IGNORECASE)
+                if match:
+                    num, unit = match.groups()
+                    factor = {
+                        "B": 1,
+                        "KB": 1024,
+                        "MB": 1024**2,
+                        "GB": 1024**3
+                    }.get(unit.upper(), 1)
+                    value = int(float(num) * factor)
+
+        except Exception as e:
+            logger.debug(f"Failed to parse {db_field} from '{raw_value}': {e}")
+            continue
+
+        clean[db_field] = value
+
+    # Ensure required fields
+    clean.setdefault("file_name", raw_metadata.get("FileName") or os.path.basename(file_path or ""))
+    clean.setdefault("file_location", raw_metadata.get("Directory") or os.path.dirname(file_path or ""))
+
+    logger.debug(f"Sanitized metadata after parsing: {clean}")
+    return clean
+
+def insert_new_media_record(db_conn, metadata, media_type, logger, dry_run=False, file_path=None):
+    mapping = MAPPINGS.get(media_type, {})
+    sanitized = sanitize_metadata(metadata, mapping, logger, file_path=file_path)
+    logger.debug(f"Sanitized fields for {media_type}: {sanitized}")
+
+    if not sanitized or not sanitized.get("file_name"):
+        logger.warning(f"Skipping insert â€” missing required metadata for {media_type}. Source file: {file_path}")
+        return
+
+    logger.info(f"Preparing insert for {media_type}: {sanitized.get('file_name')}")
+
+    columns = list(sanitized.keys())
+    values = list(sanitized.values())
+    placeholders = ', '.join(['%s'] * len(values))
+    sql = f"INSERT INTO {media_type} ({', '.join(columns)}) VALUES ({placeholders})"
+
+    logger.debug(f"SQL INSERT: {sql}")
+    logger.debug(f"Values: {values}")
+
+    if dry_run:
+        logger.info(f"DRY_RUN: Would insert new {media_type} record for {sanitized.get('file_name')}")
+        return
+
+    try:
+        with db_conn.cursor() as cursor:
+            cursor.execute(sql, tuple(values))
+            db_conn.commit()
+            logger.info(f"Inserted new {media_type} record: {sanitized.get('file_name')}")
+    except Exception as e:
+        logger.error(f"Insert failed for {media_type} file '{sanitized.get('file_name')}': {e}")
+
+def update_missing_media_fields(db_conn, media_id, metadata, existing_row, media_type, logger, dry_run=False, file_path=None):
+    mapping = MAPPINGS.get(media_type, {})
+    sanitized = sanitize_metadata(metadata, mapping, logger, file_path=file_path)
+    updates = {}
+
+    for field, value in sanitized.items():
+        if field not in existing_row or existing_row[field] in (None, '', 0):
+            updates[field] = value
+
+    if not updates:
+        logger.debug(f"No new fields to update for ID {media_id}")
+        return
+
+    sql_parts = [f"`{field}` = %s" for field in updates]
+    values = list(updates.values()) + [media_id]
+    sql = f"UPDATE {media_type} SET {', '.join(sql_parts)} WHERE id = %s"
+
+    logger.debug(f"SQL UPDATE: {sql}")
+    logger.debug(f"Values: {values}")
+    if dry_run:
+        logger.info(f"DRY_RUN: Would update {media_type} ID {media_id} with {len(updates)} fields")
+    else:
+        try:
+            with db_conn.cursor() as cursor:
+                cursor.execute(sql, tuple(values))
+                db_conn.commit()
+                logger.info(f"Updated {media_type} ID {media_id} with {len(updates)} fields")
+        except Exception as e:
+            logger.error(f"Update failed for ID {media_id}: {e}")
+
+
+--- Content of ./.git/refs/heads/main ---
+00b4510ff3014e8abf647d09582f16b9eae91450
+
+--- Content of ./.git/refs/remotes/origin/main ---
+00b4510ff3014e8abf647d09582f16b9eae91450
+
+--- Content of ./.git/index ---
+DIRC      hqœ)A·Ğhqœˆ      şÖ7  ¤  è  è  ×ˆÂxzfÑÙÄ¬‹7ºÊÖ›„°=H %__pycache__/app_utils.cpython-311.pyc     hq·ÍàÆhq¶‰      ş®q  ¤  è  è  #ÿË˜û³VO+âg-Mq~8ê"Š^ )__pycache__/db_connection.cpython-311.pyc hqi%8Ã-hqi#      ş®ğ  ¤  è  è  ´Ã½
+¯7n@u^•RàføºHR +__pycache__/metadata_parser.cpython-311.pyc       hn~†Fàòhn~†Fàò  ş¨‚]      è  è   5'İ¨ì|G~›ÙÂnşCßàŠmó app_utils.py      hrWeÖøvhrWc      ş¨D  ¤  è  è B­OÑ°ÎFé$ıù–£úœmQ‹îÜ‰ combined_output.txt       hn€"ğüœhn€"ğüœ  ş¨!  ¤  è  è  ô­/ç>æ¢_}&œN¿F3ËÆ* config/media_types.json   hrWø02FhrWó      ş¨G-  ¤  è  è  I?øhôWJş½q~± .É}ÂÎ› config/metadata_mappings.json     hn~}-ÌØ´hn~}-ÌØ´  ş¨W      è  è   9$u²fœ…¹©=óû@îÑ˜ğNÉ db_connection.py  hn‚¡3—‘hn‚3Zù  ş¨Å  ¤  è  è    æâ›²ÑÖCK‹)®wZØÂäŒS‘ managers/__init__.py      hn‚°9(Uhn‚¯      ş¨  ¤  è  è   ÀÔ0á·4üiç›B#™{¤ğ‚Hx -managers/__pycache__/__init__.cpython-311.pyc     hqh(&ĞÒhqh      ş®ô  ¤  è  è  îpƒ²£Æ¿¦ÈÒO)ÃU…3Ôˆ‹° /managers/__pycache__/db_manager.cpython-311.pyc   hrZÛ
+ÄGhrZÔ      ş¨V³  ¤  è  è  '¸[(ªŞH"j”˜î@ª–œr‡7Óœ4 2managers/__pycache__/media_manager.cpython-311.pyc        hpb!`ÛÖhp`      şäQS  ¤  è  è  7dÎôÛ1íhò›ÄØi?d‡ê §É 3managers/__pycache__/media_transfer.cpython-311.pyc       hqgÓû?yhqgÍ      ş®Œ  ¤  è  è  ¸8˜é+Ä	g>ÜÿÜõA_,fğq managers/db_manager.py    hrf:‹ÿhrf7˜a  ş¨xè  ¤  è  è  $½ĞòuıÂnâ.Y$¨&IÕcŒU2Ñ managers/media_manager.py hoş’9›®hoş0€’»  ş¨ Ë  ¤  è  è  ³­–%TJ¦S,¤;{½˜ «Î managers/media_transfer.py        hqi$8‚îhqi      ş®Æ  ¤  è  è  
+´˜†…Áká`ª·^´N³gN2Üõ metadata_parser.py        hqqÖ»×hqnü      şÑà  ¤  è  è  Öáèæ…¼²¼ü,ü‘µıã›s old-processmedia.txt      hn|0‚7hn|0E.±  ş¨‚K  ¤  è  è  †„[lcÿ†?JR½Qa«Ñ$ÔO processors/processmedia.py        hr`Ê@hr^’      ş®#=  ¤  è  è  *9ßmŸÉÉoe?~Ú  YqÆgJ±0 -utils/__pycache__/media_utils.cpython-311.pyc     hre8*Õhhre5Èf  ş¨x¾  ¤  è  è  –œ”y¦66àf†Ø©ø$ğÎ¤š utils/file_mover.py       hr`RsÌ«hr^‘      ş®#,  ¤  è  è  hj]T›=t Íÿò+V“M	KY utils/media_utils.py      TREE   22 5
+ rİ%Z2(uÅÊ§Ÿèutils 3 1
+ãeïøâ¯Àî1UÏ*R’Ñ__pycache__ 1 0
+ ˜ «ÖZÁ³àà{!·`¤Æ¡)config 2 0
+øÛ÷hÁÚÛşõ2dëœ@,ÑÑmanagers 8 1
+i–M¦— ‹ØTÚI†h5ÌİC__pycache__ 4 0
+Ñ6Àßê9Ÿ{Ÿ³[çÜqgi‚c‘processors 1 0
+.|ŒÈT\é„Ì}óÇŠÉŞÁ…O¦__pycache__ 3 0
+àóv.Óò”M¿®;Ğñ ZjP(€Û!Ë8†Óç§¬ûÏJCû2
+--- Content of ./.git/info/exclude ---
+# git ls-files --others --exclude-from=.git/info/exclude
+# Lines that start with '#' are comments.
+# For a project mostly in C, the following would be a good set of
+# exclude patterns (uncomment them if you want to use them):
+# *.[oa]
+# *~
+
+--- Content of ./.git/config ---
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "origin"]
+	url = git@github.com:robcampbell08105/media_organizer.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+	merge = refs/heads/main
+
+--- Content of ./.git/COMMIT_EDITMSG ---
+This is working for processing videos. Now I am about to work on importing from media sources.
+
+--- Content of ./.git/description ---
+Unnamed repository; edit this file 'description' to name the repository.
+
+--- Content of ./.git/objects/d4/30e1b73404fc69e7199b4223997ba4f0824878 ---
+xKÊÉOR0´4bXÎËËÅ óšò2@ôcŒPÆg6 c:C
+C0ƒ&£ßJ†"& ÿ3HòW°~F~nª~QyrbnARjN¾KQ~AR~…~@Q~zQbn±~@eIF~~njJf"„ŒÏ/JOÌË¬J-ÒÏMÌKLO-*ÖÏÌË,‰×+¨üÅa“›ŸRš“jWÄ
+´äŠb~ ñ™‘‘ñŒ(bŠ gÂ4S
+--- Content of ./.git/objects/ad/2fe73e0b8ee6a25f7d269c4ebf4633cb0cc62a ---
+x5‘±nÄ DSû+ëStºsšt‘ÒäÒD)À`BÂ„9°åßÃíàê-³#˜]”J<Ï¿ƒãIk¶ñY|ŒßÑ'q§AWĞº…Š"3»B+X¨F¡óeÜÌJ’•9§s5p†n]—	>İŸJşØüŸ§{Âw§Mè	)N|…Â”ÅáüƒóâÁJFÇHÔg¼Z¦	NÊŒ—^t” X×®ì\ìÅéìå¦]Àê(^¹+%Æ¯òÔ…`±ÊJïL <V)}sbâ×0ßÈ¬-KÔX™¸»±GñÈ¼ûBŒ™/o„w)·mÃğ÷p‚,
+--- Content of ./.git/objects/ad/089625544aa60153812c02a43b7bbd98a0abce ---
+x“MÓ@†9çWX9¥R)°Ü*•ì¡²qŠf§;j:<¶UÕÿ=3n[sh¾^ûµ»==Â»»·ï_Ùİ@€|‘ïüÓl?=õ´ÙX·):¦&<õö²ò‹<E‹6ÎwÈug{ô•§‘ôs†7æĞò¡æÑ­îMïqŒ;ú‰u–¥·³erR¬@“Wéi¶Àı`\;zäjeä;³ÅÖ²Ï¢9àŞúPÓvõÀ#ÎŠ¨ëˆ!Ù€uùÎ''uKŸjík²L¯nXªŞvà(œ‡Iiâê«\¾Šôdl‹gÃNğU]ù52‰áxæ{‚–ĞÇ´1Õ¢L¦< ¹`İˆ©}«=1‘`­çkoBäÙôÛÌ>¶tQ“Æ9³CUÇ°?&3ÏÍÄAfğ&FD”“F¯­¢Ë³Êš+ÑÀØÙ½èÊëõúÛç%”J0/ ì”åUÜÄÎºÜ1å9=äzÜœàõ8J'Áu•!)]·©-¤5_44î*É(KêÃKô*Ó#é^nìíŒ*|øûGÈ˜R.õ¼m§2=ÖñOÓNë¬\&“¢Ó/î|ŠKŒüw…“-2ÿ{#N-ÊÎHşRêÎõûÿ$7Yæ‰ÿ^—ï4öídÇ®Ó.~X
+--- Content of ./.git/objects/69/964da69700148bd854da8f49860d6835ccdd43 ---
+x+)JMU020g040031QˆÏÌË,‰×+¨dx6÷ÑìM¯9{wk®+ºqèIOğD  ª*¨LNLÎHg¸hvàş+ËùÕ}ó7G?¿S˜Ù”<jXJR|nb^bzjÈ8‹/µpò§Ûİùç«c¼Î„´…P…¹©)™‰Èj/|*ı{(ï‘^¤Ê
+5Ï«É=¡Fç¢¨-)JÌ+Nƒ¼–cšjˆ×2ÆàF¦%ÖÕ{g,X} a|X±
+--- Content of ./.git/objects/e3/16071665eff804e2afc0ee3155cf2a165292d1 ---
+x+)JMU042d01 …øø‚ÊäÄäŒÔøx†
+«¯EÜüàAµâv¦„%Çj2˜™˜(¤eæ¤Æçæ—¥éT2Ì™R¹ÌÌìAš\Û•?T>œ["È>ª075%31¾´$3§¤2+6d¶mÉÁ³¢Lÿ?i‡Möåô Bª1Z
+--- Content of ./.git/objects/e8/e685bcb2bcfc2cfc911315b5fd051ae30e9b73 ---
+xí}ıs¹‘öû³ÿ
+¼rm‘ÊI”½›½ä”Sê•%Êæ­¾"QNöœ-ÖˆJ\“†CÚV\¾¿ı§À 3CJ^{7NŞe•MqFw£Ñİh\³kóí·OüÇÿMfÙ|a²ü‘ıëÇ<›>Î³‰9ïû°3InÒ-Ó~7v“›\ß’EºMRWÈıŞ2|:HÇ‹Ä<6íÀ?Òº‹¿&®ÿv½çËëÙ<ë§¹‡'™ßÌ’y¢©£lnúÙd’LÛãÑ45x·œ¤ÓEn™Égi4¼C‰éptc†£qê[½Ëmõôİh1šŞ˜ljúsüÙOÆ&Ï³¹ïoœİÜ°„vç~¨›9 2èÛÒë¥M‡Ù|’,FÀ™E•`D+Ï 3M´ËıóAwcßÓ<ıÛ2Í¼–$¯Ùï‹n÷ÜøW×i6MÑ…ÇÑä.ÿÛ¸…aNÓş(ylöM÷EçÒwNÛüvœ¾{ôÈÏÀ]¶ú–ùS‹©J® Õ¶øÍ$,²Åün÷‘ÁÇgpİ+
+=JßõÓÙÂNj›ˆÓÂ³ùhºhnèÕiÍîlÛfš-Ì0[N-s’¼NM¾œƒzÜŒ¦fq‹	Èi0šËÀî‡øùİâ@Î’ÅmkcS Ìïòç³ùt“ÃÜŞŞ62÷K #Â“Gç/Îºg½ÃÎ…Ù3Ér,„8JvÎo³E–7½ì¶k¼Rx~vöü¸İëî×>»êö.ÎÎº¾½Ûl’îÌßö“Éì:wçÙì:{·ó,é¿^Îvºd¶\ì<Ï²›qjl—˜°ÎÉùÙEwÿ´»kn“éMŠÑòÿËa¦C’6h”›ôİ"æ¨/7y
+ŠÕ™t8õG ~3Î2ô†ºûƒA:0“Q“’Šz»¦5M‡[¦5OŞâÿ^6Gdé|?'³ù?åW’³Ü773Ó|#Ø|Ô9ÙŞîµÿÒmŸ^vÎN/É÷Ö³›Æ–áwªÌ¦ú}3Ê‹Eñ­nÓQ_Ş¼M¯gò€’o€%ß ¬ñÁÎH¹¿Éì·Rf’½‘ïäÍH¿Ößht¢,`†$/0(_ãÃ£ıããŞIû°³¬<ØÖr
+Ì7•J
+˜61‰W|#S¡4›§·œ¥7 â~2b8›y°HNÏN:§ûİÎIïzWÇ@ìÆíb1Ëwwv¦ë[Ùí.æiº˜$³V6¿Ù™§oRHÄ …«ËöEÓtÚe#V„
+ıv¶˜æ<»vtúä÷OŸ|ûÿn&Éˆrd²¹“äE:'ıÔ¼-n•û’şbIIÉA¯‡íãıï{—íƒ³ÓC’ÅÓÖS´t2š&Ë‰y
+Z…è ¼'wæ:]¼MÓi!Û@Ì³t h–Gı;¢Íñ1Ä§ŠceŒìkÆı°ÇhÒtNÎ¶ W§üÑ^˜7`»P@şêB‘?²Mµ øF}í¡)í¹7Ú˜Šô½ÆWÍ$ïS\læfÛ|¥e§Pö÷ëxh3olJÛËƒ·u“.z:oöz¬Óëy!uè„ïÑrŠöÉ×”T@\6Gà`Hı%„3%¢Ja<‹dªÖƒtèDxopİ¶±ôõ¸ôm±ğÏö÷N³iº©‚zccC„g;Ç
+0å·)¤ŠkƒôŒ¾ÙïÉİåŸı:Ñ’:ûó›\[áútfš ĞÍ]sé7ĞêOB€å¤2¡ÓöØJ¥4²e²ANÆhîRÁw‹ƒ´ÅÚ?-ÊJ’„,ÿ£6{‘.–ói iiÁtK'ºiÉ0A\Jñ{×t1öºÕ1»şE´‡C¿Tr Üw˜hjã;“~ÄJ«kš©ÀŒ†ºŞ5„7¢N`}k`\ŠĞnôÇ”éÛö=–¿Öä#—ĞºX+ÔL§j{ÛÎ³]4œVdŞfó×ÊÄ¯ÂVğM)[ƒr¥€€‹¾€.š=,¤
+]A„«®±x4¾A'Ï¥ó–èRÍáÆ¾ Œtî¸ÃJtÑÆû‚@ã}¥C¼àÂhF	 uat=wT|ÿ0ÿÓçèØÎ¾#ŒŞ"ëy0şÜé¾0g§Çß›¯ÍşÅó«ÈØKß++ÒÖ7³¦ãËÊT±	ĞC³¹q¹ìS%.IZ¶#5¬jµ#62N±ÕŞÚ¢Ä‘Ù!‚Óbí”8Å³"úœë‘:KK¶ï•=ÀÉÂiG¿O?àE
+œˆ²y
+•¹GÉ”æ½Ñ°…±J28-É°)LEñüÎhM'0ü‚€¨;3ÈDMÆ¨8¸ƒ‚„–Wˆ¶©i>\l`d#7úËy:İÄ¶ôW“…•gĞÒ¥ ¸\tAõáá±L¡áyåiĞ‰#ÎøÁE{¿Û6İıgÇmÓ92§g]ÓşKç²{i†XÒsÓôÕX|4ÀÚ5ûWĞ‘;§¨Lê6çĞ‚.¾7ßµ¿ßŠŠ‹{¹qğbÿ¢ùõ·ßnš«ÓÎŸ®Ú¾Ğ¦iŸ>Çd¯3f‡ÏÌaûhÿê¸kXá²İİ[.†¿Ÿ\ÿÖœN÷»%«ŸÒ^ôß†UôşØ\¤ĞüHôxU^!H)ØÉlHÎƒ¥¬—²äJú³şT¾È2HœéÍ†îöDîÎ2èÕ‹ôšy:À¦$™öïŠ…‰û&jÈØd¦ š·ºÅ`L%Û0â5èÀ8µ^€)xà´œPÑ?×=/9ì“&ˆ«c{$ãgéÉo%Ÿ{#«‰<Õy#;c¹Âàˆè/¬šÿÁ`:°5r¿ëF-ºàh:HßAÑB?M$#«o9İÎé÷ (lÉüÜ?)f1*ÛKæD ¸±Àü@ ïH€F´[Ó³ù»ÿİæ&Gw}	:øpôÜO(É4•Ã„)ÂÃş³‘ëçş<Íf ßOšr¨Ğ°Øˆé†úË²æCÇ*ûíO«Ì{EÅÄ#eÆY_%BÌ~âIˆ0çdã¥ÈWêÛ'›qcùèï©yÖHëÆ/Æh~±¤æğì
+¢¶ôd·úmÄÊªX²¸ş½Æ>©7°…KçIÚ_4İ1®dêxM±üv¹X¤óLgàİ•XH@cP©‹+xåÙêêÃq’ß’!u<º¹]ô&)àXİÄ[à+"×R3,Aàš2ıÑ¼ù˜©ó¡ocÉp-bH:şÑbaFVéÕ­×úFWíxü,MU(5XÌMÓÕßm åKX<:»hwŸrå/
+oš‹öQû¢}zĞ¾´6¬&jB)†Œ?nCİ8Ø¿<Ø?,qAÔ–/jJXßÒ3ç4„|¢Ö”åÎŒŠ«1mQÙV¯3Øx.ÅÆs’ÌLçPV/*bˆñØ`¶¶¸›ÅÌèšÂ7ZK[7-˜æ¦à~¼Ş&wüšÃ
+Ci×ˆšŒrôq§ëG®2mîÛs»„Ù}›z³¨\É`@sxÔTÛ,ÏOU…ÁæpÇoÕ÷}†±£^Sâ£„®íËàf™È2!9v¬r­ÿ~v~)†öıEÂA¸ågiµëÿªˆĞÒòêgÿ«Ó˜†sšHÅ_V÷úËÑâEw­*÷Q®¾±'Ş£^­ØÓWuÊŠ“*U©1®-]ïÑc\éHùx)Î­zQOr¤Ç8 £¶ÎÿÄŞó4ƒ‰†ƒ¤Å"Şs~ÔÊ£'ÒnâWUİÂS'–(¬6D“î`Ü’m½l¡~6•]àT;9í0?@1¡Z,“…Å4ò pLj¹ƒ[:í/iS*PJ	Ø1étCT@3~S²ˆwÛV:ØÁœõ_§˜P¥Í´¶Ñ‚¾­¼¹ùêÉ-8`F³æfh^­·öÂÌx,ú·4üÀJw>”BXòQ2yFÓeÁ“h‰Â4,¦7†	­xÿ:ıÑå !âøÅ¹—ƒûàÁvÁs53Ñü5É°Ï¼™CëVk÷ …jL²eÈFNÇ'´LË¢º?ÎòÔbÒ‚¨FóCçHĞIƒsP0¸#ÖÂt 'Éüu/É{Şˆ%¦fìœ-­du>AyúÌnàë…û—ş(±¸Ñ©f<ì¥m<CÙ¸' ü‚g"ÜÃyéhªˆ31‹ë`	$"6gÒ±vè’¡Z°Q~‰ê]uöÎOçŞé.eú™)c¤°åA˜;ôB8Ä\òrÿø
+ûĞæWù–Ññ{îJ¯Î;´ƒs{uNKJÑ8ìîÚFÓ÷©ÿ›Ò¨Z"ãÛ2!àİù’WèSt·`-nnÂ,‰X%İc£.ÄÂ~,f}k …+`¼œL‹İU1Q$EÛ{?ÅèÑñCq2ŸQXól<¾F„K ¿j…	Šœ»
+¾ĞG§…h-±÷#²êèá\z@nG\Ñ°†So$çºfHB1¡íŠŸûçp‘1ü¼İÇš"»”7+Şíë,Ãÿähi4™$.b!$¶ÌQ2Qf(7;Ê­ËÜql-ÃFâ‡m½xº‹É‚EšÛä<{«Ä	
+åˆK} €Ô²O–±’l8±åûeè±iO%fd˜Ãw—Âc£î[ø0XŞºÔ €j°FŠ<V¹_ë\ô”Ù%ì[İ‚>ÌÑÅÙIE†ıù¬cÁdîA0Åb³Q0›0Š2Uœ|­aŠÅ±3Y·­-ÉˆCıóUÃjC•“zÎöÃ©åJ_ÛQMÛÌRÃÊfù“äjáR
+B´Y#úR<ª.®Ò¢!bjDÊô²yÏN5º5˜VMüKk0˜`>‚2 Ö^æ—dT2â%†dÑ[cCµÄ˜€Ê¨¸Ğ»ïñ[? <gÀIœæÓÆâ÷‹@pã‚Å±
+
+¬ÀT74Ğ”vªH„ÛDÄÉ´6¸k:"Iæ)B3Á­p1	·)ùd“˜5¤µ¨tKDÃ€ù =â3Š•l‹¦ğ«L¾Q.dzuèŞú8¡(GËg¯´:1ÒUÉˆØ±˜1ï3>ˆØl¼çK!ô·j³E~"iğªÁZÁSÈò†HÜj•]ÉF¨)ršÂdV1¢rµ)ÌAâÇ7Z«¡¸·%\»„Ù<"ì´Á=´Àr1< lŞ"¤\Û#…e¬`,ígZé"½áB[°2bÏòØü§Ä¿Ø?}Ğ	GÍvÂÏcóBB w'Œİ °;›î¨š0lˆøÃLmíLl«¤?¡ï«LéÊøJY­rxÜ*•-Nß&s†—bv¢áÒv€–Sß"(ìÊæ<FÔ&2¾…è
+Käé˜qnA”CÁge2×¨]ãÖ­†®è
+¦s¯×±‰+Se÷¦´Ré<`S9W,‡©§Dh4ÉL 1—P3×nøÚ€æÅH–mı#ÊŒcf™[Tv>(•@sÁÎ¢‹lQBıšvu[/š)b[DbCZ"BÿÆ’BÔA,‘eå}	=WÓô\­ª.¶uál¥¶ª\+k5‚éñ‘}ŒÁbÕ€JQ1 ËYU	‘1¢¹<‚Ê„‚^ 	Í’zº¨wvdl÷ªBz€á$]ÀÃ†ƒ3íw%¢w›"L¸Ù0b‰‡V¤«‚f‰}0äzc|—E¶„yçğãb¶eßDÆ–¡D5jä¿èÛ…Ve»Ë,v$1˜jB\µÄZÙ0¿sPkö¶å¶Ñb3šÜ@«• )‰Yûñå¡@Ñ÷ücp6eÉb1G­8+{ ™e›ª…‡-÷¨i¡vôC^\$¨ô&sDˆÃÒ­Ñ"ÀJ¯“¬=@x:LìùƒM­îşóKÆn7¥EüW(î®??„W¶şh@úöÃ±Tæb[-rÑ“â¯Œä÷‚b™‘¡äµ"Íw(í×3ÉÊ®E_£Û–Ü/“+JqØ¥î ´
+‰k)¦*"$„Ó•˜ü¶†–È°ìP‚Öğf…•ëI¨?ád¼j¸Rt[oÿ(ÿOñ¿ïëH»m=z1Åd.!S {˜ççE„®_aŠ£e­ùrÚD_<70c`K‡tfË…loqzgìŸ²WÒ]¯Ç°°çá9¹Ö8KyS»€	v€v
+‚Q³lLw+I£Í³uÀLÀ|ÁV,$¢%¶ë¯‡­Ôúi¦”]4+*)9fEÛ¶]Ëš–ÖÌ`NÓÁ¹êTzŠU†@Ÿ·ßÔX¨Ëìs— @¢#öP)´×Â"hÿ¯K8æ}0Â«lÄèÄ[Aï¾Vsqÿ0t¨¬•Ié1Qš‹Õ=ÿÙ}vO†Û#;°”Ù°“${\-€ZE9Ùh£&2œŸp\Š¥[Iï,g /TÇØš³ëB]¿ cÖB.¶ÅèVï©Ëñ¤Hy§,‘n˜ä*CKÓ2`QOŠvoqQâÖI’O‰G;Œ2¹Á›&mpU˜Ë×£Ù]‡b@ÙC5Ø6Åñ1Ü°3OP' */:ƒÉ»Îòı<•òQaÚVa&e}HåB´<"¡ËÅ…ò5A–;Í£nÁPĞUï9êüE˜°‹È&áé]¸WŒxj`kÕ –Åâ„E}.2ê8D«ßõ1ŠÜ`ãGRãˆ±‡‰D!OˆQŸÁT€Ì©Ke	QìY+ØgÑll¯Ç&öÌôé"öA‚8b—‡ZÔ5iÊ“	±´åÏsiYAØ"l%…¥gSŒë^P”ÛWï…·X/Ï`¬Ş_.²Í8Î‹j=ş©#¯¤‰âXy±Ğ-6«…˜?š'„Æ/dŠt+ÅŸÈôA[æöï©ÀñSP©£}zhH!œk©$NDøa­£ª­3I˜?éƒqÎm–á8,œ“R‘ï5¾³Í#Vuªñº‹êgó'c¨Ÿ •¸Œš2X²îí„kX¢Üë€”C: /†¨P"İšÈá˜'¬œNE‡¡_ŸïšïñÙ=9Ù=<4/^ğËK=æÇŠü½ü-¾*``ğ|PÏ@H_}¿ûÕd÷«ùêÅîW'»_]â˜£6æ—À—Ô¸•]ı+)‰¸ƒl9†é‡¿õ$?»Âö9îÑŞ
+$UË|‡=0¥T¢,”~ìf–à€Âc¸>pR ,‘Š E‹8¦lN¡èaÇi‚Ã¹¶©GJG€@ÌÊ{?††—]Õ:)çŠà}ï$¢+ã~å°ŒÚsÚxS’ˆş?‹ÛÆæ‡wu/_¤\x»Ai±º¶,Û5¯]}CË‡à0 Áí ËIsˆj>	„PÖ_ |ÜTícßb<z!1µ5üË°Š‹¦ª«±oƒæ£>
+B•âGo ‰õ‡QA|Êwx§˜j*€úJÇLRõè
+3®¾ZZ†#ŠBÀPŒÕŒÑw©ø8°”„›êdJûd¶)”Lø•+¤ğZ©¥è_êÑérrÎë Ü·ìj |xåZÀp¾ ¦ÎåY-BäymK²Ä -¿Ô„D^E@‰x¢Nx@²g´c’°G*q ¡sQå…ÚÂQÑš£
+¨ä×lÇ) Õ$Ñ%æ.ıÕüåü*ç<§[ÇJYIü*7ûX¶½$”WÔËÊ¢@à‚qqÑ=¸8ºŠ§Ô³/×w9-1°p±|Êú`ß ‰°PÉ‡Â’ºÕéiœ(ØCò|å>6ŒÄ‡=®¿/ã…"ÇD:ÂÖÜ™!ûÓ	AûÚ‰?ıYÛz!ãl'xH[uO(‹ì£H
+­iİq¿­Æ3=Ú¦ğŠı;Åµã°gsäW-Øîm5Ä-o*•Õe7ÛŞ–g¨äœç¡:QUN“’Ğ™¼Â¹¿Fÿ€8 ¡}#dé™›ÄFù¹›Íò7­x¾ŒbnË-¸)åbTêÕ½’•§ô.šöûzws_î€‚·Ô®JĞÒÃ€,Êå€¼güHÊõk¨¥(2DHd§¹¤‡^‰Ac sVígóA`ú¡‡³ëCì—¼ø°*Uÿ‘:;Ö
+ĞÙj¥G• 	­•ÖÒYÈÈ‚DU ²$†…íÆ*IUBcóÑîéO?HDh?<ˆ6íÒïTÕ7,@ŠÕ?T(Ø?¸æ¡Ÿêñ»hòäfà‚vñ}Ÿò]lYØú=R#œÌû¤†Ÿ¬‚UhDë`ùe1‘å7VÖTÊ£O‘=‘`+H`¬í2 ”2ÄîÕCdOÔ»#©ûúşReO„°’Äqr+–]’`«Ñè†¨ZI2uÄCƒ‘¤Ÿ"T,‡–3
+s}|³‡ÌÚjÜ äy½µ›Öˆ"/9eÑ†~ˆÂÆÈªAÎŠ.F†Ğ«ÆŞÀZ°ÂrîUæ{°0µ&×ùxûºT9şíëz*ÅÆ©©ùË±¯£ûxûºÖµn
+Ê_Ì¾.(àŸÕ¾.ãúÕ¾ş«}2ËÛ ıµ¯cÙb+ŠXÆ3w¸Âz.§CBóyÕü~ô³Ø­D€Îßÿ*6rïoÎ‘±”ƒÊåü£{‘sp_\Zj7ß²9h*ÇÒşn¦jt‘'ÁÀÑ¯6ó_mæ1‹ªÍÜ¯ØHíòÈNZ¯”?â™ò4Å§ìR+5¾o o´Ä¿ºj\²û±ÿ¡ÖğÏİdú>ƒAöI_†I^´İŸÃ$¯R_­ìûëMòaáØ$ïŞ 	÷'íöŸd’)GùÍÏ`’/4À¾ß(SÛsgYkƒwRMÛAl-d“æ»Xİp ªl5kUIÊ+i£Î¾¶lg,´ErÆ>s†ûdÿ*Œül&{%ÌHÅd¾q&ûğYh6‹&ûÊ8Â‚Ğ¾	æ~Õ+g«9j¨³€…å
+2)·ĞFå•š^k‹ó±ÆävZc¦-·åh§ü<""¼\‹UG]åF¬Ù/É»ôáO2úKÕõV5×úg6ú¿Tùô3ıâ¬¢›"* Ñ²©ß‘!ü^­°ãWf’M{—M­m?ğG¬w*è¾¹ÒÃçv87Âgu	(É¨TŠ\•Î›S&÷Ø%V[åË<D¶E« —2 ¡ÜÇº®è=²-ê¸ ±rÇ±,«ĞA4Üûe[Ôi½,[ÛÅCe[ÔÏÇË²†’AG,nïŸìD6~Š¸û\N7èÏçDğx¼Ïa ùœ‰Èï]Ó‚ˆ`±ì©çDÔZï¼."óÕÑC³‹¼`l³ÔÙ–£sˆXËú#ÉÒˆèÅ©kÕìşğ¢_U)Mz¶‹¸Usî
+‚Öæü>?EŠOMÅ¶[“´ä‰İÔ€R%H´è+:t¤q’xóDæ$Š_õµÂ@¥B—¼aûHJ;AT*,O@¶oŞcµi*6?¬ÇY0®–y&^*tË\ß¼_H.GsÜÎğ-3ÒK“¯v¿ıáC«úú-çÙLNH~y×*·Ùè•ÑÛzØÔ><}ÖóUiäq¢9kƒƒ’KŠH˜§æ’¸…h¤¥Áû¼ÙKRFÅ@Ê3—FXŸ¶ÿŒd®Ï®#ÕñssÙmŸïš—x“û´—	&LT¾Hy¹…œuµp¸ø{*œ¶Ş=s”ñi²6lƒ³+äÿÍ¦ÛFGFó4VòÒ
+Gpa“E:ğ\TX"L%ZL|…`¡wğ¢}ğİ®u[?+ë!Òn-6šrºN®±â„ë5$³2Øî!(‚Ü«ÓPÄ¼[Z>Ò®QÂšÛ»¸‚A9÷©ŞÙ E•È\‚`•<*Bp‹G°è¼ìC¤³ÒÑ7¡á"ûÏJn½¸÷$WÕÏ‘i~#­
+”Ò:Ø¬P/o@ ÂLKÔÂ Ì!fxÎ)e¾"@iò¼â†pUR.$+1«ÏZ!Ys™˜Œ—]?ny:ë–‡ ÑÏº<„íê]`È³ˆ­sBÈ²gÀùK×éê_Ô‚±‹ÁHÿÅŒh¤–’İJõÏ¿`£ûG-ÿ‚†Œî]0Ê°ı.Ñß¹3RÎªár¸›èÑ0°÷ôÉ“b[!+˜=ö	×®½oÒ^?iä¤3­¼ÇüÕ\&\äí¦¢\º¼.4/€¨}ğƒ5ncè•l)Ü¶Ñ&³°ıñŸ¯©â–×òà˜ÆLî7iĞ“üÂÑL¢Ğ¦pÕåtaohÒÕŠ»®ê~«Øj tú•&l8j5M0
+Í×!à´©ùWß7ø”°ˆÁ‹2r„•S®ú³ÂI&ÍnáÜ!,øéyÙÕŠ;Gƒ˜’"P©×y†aq“jãıŠ&qì	Ïd)·üaã2Ùà8hgá>I•İkòâk‡ôå¾ÛÁWš@F«šîE{»sÚm?¿@òK[SusT…ChØ+]!â°î0 `(§É¼K¤‹».…Æ6DO¦~†ó€8¾=¶	"µNå˜Q'™€aŞØ€ãt0[çéêí‘4ÅƒÃÛTâ[p1zÃKãÌö…¼B¬8Î  á«’¡ÅîCn"Æ‡>úDKµıu®Ä:Şn£¯şwÈì5~Ó"ÆèM7Ù‚«Ö†Wr; C,ÊÈƒÍ.uHß$ØŸ<9„Ïm4¢ı¸êËrC°f–QæÉgi™XXS»i6I7N"éòiyçoK\¡UÌ°Œ#˜k#è¨Â†¼«?%‡ ‡sMû=Á±¶s›…#Ê+ğBœ’ÿ·u"9$jHêdß*[[úrr¨YóNjg–[`¢(®’b%~ª,ĞJfLaÜôíÆße<×2ËvŠy‰™˜>ªoÂâ¯01m%±LQ,|!r¤3»3æçÓ2z¨–BtoVŒÎÊíA¥¨fù`Éš„%™¶D“@øqÿ5×ÙÍ‘…nÄ–7»_”„Ÿ.H¸°'@ı5ÉÑI\¹Æ]Ã¾Òf] d‚ÜÕ¡çêıûË«qH(Ë%ËÈøV—ÄH©»ezz€ƒ&<®eÓè¤¶!DM~ÉùšÀÈ7H=ó—Ën¶@Z9'¼‰«˜)D4a’ CbùÂLÆ×ËI¯¬&Ú´ş_%4GÁn‘ú1Mq0‡JP¬õÚ’ÖœfI~(;ú‚û"‚P™YAnË¥xU& :“Îˆ~¼ÈuàJ ÈNy¾ß}.G¿ ıÿ>áŞlµk_´ÏM°¬ãšp5\‰Ğ±:N•°*¤a˜ o‘_ØjX[YÌÂüšjŒêù\Æ*‚HÖè;-sT 4©Lo¬ĞŒ$Õˆñ2z¨¸wİš_E¹ÍƒWåHà\ó‰3Ô•
+ë¦Úˆ
+M©ØC–ßØ5¶vYLÈö=Õ$ÓD™™ä@•Vwb~8ä5×ûf1˜Ûdkçªü#Z—·Î#ì„fs]2HæÒy]Ó4Á‹¿&H’VÖ÷=Íû{a
+š®Òµi#:jÀ¸½+(ÒSø@V3^‚®+¨‡)*æHx‚Ğr­Å^—‹nÿòIÀ
+Êbüp‚¾8IÛÕDª¿ş²€Œ]´Vjˆ(*»æ‚kÈL"ıETŞRu\­Ú¯H.œËä£äó>F,Oômw¸€Vfƒ&D›Jğ!=l~¸áM‘'2PùSÏ-[5{¸üûß‘&f|a®®ÈVˆùÒ¸ãÃovÚõáïôşîßÿ£uÚ>ò¶öéÑ’¦=†»˜àoBãœÿ©¦.ˆÀ³øS>(·š ¨/à±ihÆèxr8·Tö³ ¼)Ù7èÿá8¯P/‘%“ìGc³aSjn¥ñ¼
+:ş¡P/Ö¥1Î  œîg#P’Õu>÷=*ãøŸ DËl\Ú{‹¤ÙÛŞm†íÚû‚) %ë²Ë2`H–Q]EèI„H&š^6)J‡Ğ†å<’HàÛÒ9Ÿ.’¦t½W¦Š(>húßÒt¸ÕcšEr›-ãÓR‰t)¥\æH#Õf¸áe¼‰ÉK@ÊÖ$›²w«Š\–]lÆN‚*$z ¬SßÉõ%±Ë·<“…›8±„bĞi}²1DÖ8K¾oŸ‰å—ëâfÑ_•¬qÈ‚¸ßªz»XÂsÛÄÅÔÏÛ=\SØ>½„’qYÎIÅa¬Ëâ`.3ø9J±em~‚„ş²w¾k#şSZ‚5ƒ”yÖîş¹İ>uoJ)
+ØĞÙÅaûÂ<ûŞì?»lân‚¿ôxÛñewÿä<H¸„D­h£JáÇ“N78IÄùqÖ(ı¥ÿ+š½GUpÀKJ6àà®Ìê‡¯àã+˜“‹¨òÒV¬*§°;•ÃÂö`lÛuáyØ‰å1½A•ªÀf™€lƒ²5Á,ÌODË©SMyñ•É%èÈ™;v6MŸh$C@-°vwX··i.Ú¦d†=ÎoE`4z‹¼b4#9Cv§¼¥k‹	DÕ(¼ÇHF7BFŞÉÆ,±±ÙÜºhg„…†‘ac“÷“i‹y÷=8Ô²`Ê:|†³÷J˜Û)ì´S5D)&‹9ÜÆA/;‡í³ÏÇA/%¸±2ã¿rÕ]d±­²¶êøÅAA•{9((û`’:å )¼‚ƒ"b¨¦Ì Í~¤R|âalìb2‡ıÚ&WL°gìg7S8Gpß‹dÕs) \ñÖ® ‘øí÷µæìÈ]ı÷/wq›“ıîÁ†Çø4„®˜òC!ªÓóYÇ‹((Üú LÔIvì¼(ãFø\V8ê³/5Y® “MŞr1ÃuÓ›õØ‰fƒõ[]m"‘İ#ÚBh¾uùü@£éï`¢ğwOÍk$)W‡ZsÖYR¹ï„¡®6ÍÁ”ºˆÀrsa«Ø=\Ğ€fxäó ‘¡«Åo T®N¢+k# °ò1»éª«k‚¦6M-¤¶OÛ\`evp7–/û°´çz^vM¿Zç¼q`¹oC	QÕ¼=`Ÿ4ĞX= WS×]é]}_Örm5¾ ú£F'p¸ïÉãNÀ%øRº¨D³È^¢ñ>@ØZñX\|ØT;€ŒŒ
++piHËhH˜Õ1
+ø%ùlÍŒ,-º)ÑÁ~KªG¤ŠÈû)åäwµà8j‘[æ‰\·Ï»”d×DÕ ¥,™ ×É­¤q=¶ŸÛåA†Ø.¿l¯Äc¥©Tz˜ù~AbıFt ¥,Ù7#!&ú^ğ¦æ¿wšZæår€ÛÉÓAuÑuÈ‡Ô’„ùã:}Åo¼~šãÀ®‚ºrë©/hÉÕĞªriÈë6u0‡ßş
+’:üESşâÉCà/—^½>àFW"co,³ó%`Å^¹!r=^úl%.V¸ğ—s‰º^ùı0Óê¿!±C,ÌëÇ³j+ §Ñ/Œ•PKŸ¡Üãd>OpCüYt;R—)vĞÖb!¦Mö°:5>Gjasn9uÉlú”?!M¦Ö ÄUÙ^ÛîÒ0šK–‘RWûS³,ß“õ±}œceÀ‰7©aõı—C?½P©Äor¬àİV™ÙîZ]§´óØt$Ê	]ë,¶Ä‰\ BıƒÛ1Y­ÓÍ—9·èè§I4Yf¦UMåV3­ËNƒu®aPù-×â×%'™n}’ïÄTïPC¿:ègğ!EÈµ‡¨5«“~™p)Ö ÜíÚV†âp£eÓ-ğ5Gœ‹˜ˆ*XŠ{ºXw 4©ûmÎ^Cïê¾ç&@İ\K¸SéÚlx¡“7ÌG YxŸy±ŞÁæ|<ÎµÖ/–¯	Ø}G³ïšc›[´0 oÁkwÔµx£ÔˆÎFII–îŠ„ÎÌàæF®qŞ}êæA“Å-äQ?CENÎGÜK¨“b*ĞY¸”Iic’Ëæ$lÕ”HNw¤ƒ²Şê)ÄYä›§Pe[RšX9â…‰îow>Aï:‡kchr'öéY…Rkjşp‡ó “5ú¬ØòˆWì94ê>/hG:ÛÕ…z8)ßÂÒ…¨ NJ«ŞG¨åÁxö:x™É÷ ãÃÖ{€]@ÄF q ®VL˜Ô¦½P®aSî“å!xU%¾Mö—@¶°™Ş«õeö6y"ŒØ‰÷ª¡oq~0À{ĞÉG 3)¥’,˜%Ü‡›ıU“³„¾Ó¹/Uc?©_óx~ÈûğÖÁ®‡3¯â€ÅnÎ`37U²ñ•Ö5”m/×ÄÙ"ØoõÁÑ®ÿ;©7g—'²#Z¬±VtLïı“ˆ7¹°Î@¢q2æólysË «¤ƒ¶F}˜#†bï‹º)Qñ[’9aú ¾v7Ï»1qó_i™U¥÷jÈóÑPhàæš.×êIH+O®ª(“¸ì‰7‹øôeËékì¶¦õÍ‡\.¢ñ¾jDok¾„Ø˜€­sÔ.'¹Q»ïF‘‡(A17Ìô¸iÂÿ”óGs÷£“ù¼ÍÆ¸=‰Ñtv84ÉM>T[òøA×WqÛê'¸èWÏãIÔo2ÇZ@w°â4Ä˜SìÕÁı^8»ù—wCYVF©†ô5yÇIu3î’-Úä>è›XºŞb
+|ÕpòÃ«†Ã,¯s€^m?-nÖrğ{M#:[A_t2ıAß-TÏcóµ88Ù…x†ŸBœ·¼ñâGº¨ @‘óë7Ü?ø–·7‡šUDøöz¸„l¯Ç¼Pç ß NN.áå€ú•ô3/¶&²z¨,…X¥x”/I¦*•taîĞ?ë#ÂD­Ô‘3±*Á<¨^¤kl:{¿¦Ä#Q{ ]RbŠŠèx¯„#­)Ñ#›T“QmM÷ºTËR"ˆ¯LG§[¸51†•ä‚J¶€'$$y’¢Çˆ6½¾!zü—:âª<BÉå†•¼K 0ĞW°”aĞÇhÕÏy'RÇø€Ÿ²†P“~ŸÅ¢LÚºŒ5uş `,ÒcåŒ‰)wâë\@˜ZÇ¦ÂªË²½Ğ{JâA±;~^î_µ/y!²KQ÷]_1p‡WçÇ„¹›ïÚßÅ‰Ğ¡½èÿnÀ¤v+ƒ#%Bz+
+„Oƒ‹GÂVù·¥Û*¡E7Áö©üd@¶ŸNW\¬iŞa³€Ë=A{¡Êk[ôªxƒâµï'OªtWRkïªöòÉkõI›ÙRI§V{A:Øñ¹åI—â‰²¹åqÏQ°[ğvm×gœk†=<À®Âb²#*ÎâV¨ÊZùèË¢DŞÓÁÏØmØÜ¹é¾çÂh‘ı6¨i&¿ÁÛSuñ^R„§3³Šx…hléV†Rå µKI5$±f{Eô†¬0Z:^W\7• -V³e`ÙêêíZ°såLr«nŸÖ	óƒ^ò¼<øêB?6ß´Œ®)m`›èÁ­¹êÜÄy/œŒ	®7-ÏJIh‡ÂºÜ¸tP	NSHn[vŸŠí0îŸ‹CeIdË=T
++¥"L?Pò†`Mè»»J8`@_6mÅJIıÛAH†)N\ÆËµ°uin¤®F—^°wpY%TJª6cè›õæ»²IADF`9.nü®m-Q9«,Dƒ¦ıŞüÑ#
+ç^¡$ÍS;á‰Ä&2ûˆç)®Dà“„F;3U^Ø\”Ÿ±é<ƒ±&9z”ºD//>uº2m~j¨ê0ŸÈ|Z”mãÑgÇU‹Ğt…<×[ï¬=ML«2±¡˜ë>ÊšQ¼œOƒ£"¼ŠÎQ…qğ°Şš'û3ÑÉ]şØw3Î®¢´ñ*TĞ?D‚S"9qx6©o§\"4Ëÿš€[×8É BxUSÿ‰¯“Îé>bëz‡íãıï{—í¸A.yq• #‘¥ÄŠ¼à)­şÑhwÍ%;áäS>¿/ºÜm}=ü€à®A›	^cã…PÊb?Z*m0‚i¥Y´eÕilPPjhAi€„`' dñğò>>ƒ½xF"—¢zŒÁ»-àÎn€BÅ§00\(dìçSP’-dÓ0i_ÚV[Â-v†`¼2XÒçÛû7(JC†Ÿ««ËöEñœ§z—–Í íJGj+
+®1hg¾Œ’ø`ÍRë5—fAp.¶€œÜ»º8Æ™.Áè~!¶cÏ~ÃPBE, Î]ëËš-Ñ7\ÊåCBæi³&³ÖYúâüŒ¹Q´Dpö0b{U-‡,7Â>Û¾èvÏU2'×p½¸Š8ËöÛwï(¾}÷® Ÿ²pºRr~¬Y¼öıƒõ¤(ešÈ/9¡dùYiÂŠyr½Ô,E›ñÒVöÓÚ•€Å=lU¥ÊBP(¾!”” áifŞ$c Õr,™Ï&â‰;YÑ?¥ôoSOYúéíóVW©¥@*§â…0	]
+-xyA¡H°x–mÛ+Ü³%x”n É=ìUYÊeí‘•&DÉ\Ñµ ø[ÚüˆCzñ¤á,…ø‰²)ˆê¬nÒ’÷Ğy9y	:?Ñ÷H_­2¸ÛBÎëbÿTtSRdôdY6[‚’RÙÕœëÖDËÙ…cG]·úCó„ü’ŞC§ğØ)(g3øf2_‡çw!J;„?ZeN­*äˆª›k|tRœ'Ó`‹„†²œ@pâ“›bƒİÀ&Ä1R´©Uù\C‰Ä—6†‘‡ÙhÜÔè”Š(İY62î±h_	Y˜EïppÏjÓ{«Š¤ê7Öe#d9ÅêŒ"ğØôQYCî0(œ_ö‘(À¾óŠµ;(xÕnD˜ş,¹ô(Í©4wK}‰"È{‹Ìë«
+S|¥İ÷v.»Óƒ®™µĞ“Eşv>^i‘*ÓÑÅÙ‰ ù§Çí£®ù¯³Îi	sÓ7Ø,bJoú¾9üôbßV:ÕmxĞJçRğO¯+m”ß…ıñêüA w$+?à”Z…mK ë±-Ü÷ÑØ~ãQĞ«°mûóPlÖ`;èe=¶ƒVÊÛ(¿{¶•Mu" áL,ôk¤µ•L+¨»Ğ4¨¯Ğ{KFà¾…Ï¢œ%I¯¦¥´‰3éÈ$ïx‚ifõ£ÑÆØû™)¹‚(ş1@r¨÷lÕk×Ï¾ŠVîAÂ…‹øU	‰7å%Üâ!Ür³{]J[÷ìÒ¡ƒŒ3ºeîÜ‰lšöŞÀè@¥$®šÎŠŞ¤kâäxA]8‚F±<ñ,x4ÎªŞ¤]‡«ŞpCƒ"$Dx0È³QÓ#
+»è°#Áœ±2e$µRI‘‰¹ ‰ÊbG‚—ƒÔ«º†qGSû%£’ğHõÔY(ÜYÜ™A<KÈ¬„şÀbHó?¢Ä ! %Tï^ÜÌå{×ö4ŸzûwCß|+kz¤³aF$"Éu\i˜õ©	Ü—¢ÔõÃïÚF›c4c—ÖÚA7şL[ÃÂæİßÎZZIÏ+ƒÁşMãiuÃ+$“kÄ}{û8}U¡P*k=,^©¶:F
+dmi;°C:¸ø]Û†Å§.µ%>>EÀ÷>õ×OÆçP9Ê0>Uw†_Tş„ø,Kş°¬–.{ÉŠ°î”Ào‚M	>rğaİöÕµ\İ´»7¶¿bó~àORCºĞ‚ÑGìvW¾gÊü`ëŞ*Ò—qŒX€Âu€İÜ³®:H‡÷û×Ü†^7Ğ¶Ë2‚J0–Wà*:*h]B²Ó	—Ôúñ»q?…‹Ş´g ®ìbeò”EdU{lÛ4%å÷Ğá4,K#z+n† ¤,ZNûÚ=6YşÑ#=Aw‚ğis,qb<1Çp_FT;•–6˜±l$óù»‹ø’¶ôsyÓäÒ‡Ì\lØ'‰>Ğ'™İ˜jÛT
+{h]mnlocN‡£È+À’Àî³çÎ¶§ïfhñ0óæÆÿì´&w­şt¸±Æå}›g *•@–ÔhŠeÖãFİØëÊÄ €ğZíq×øæ7×Ã
+s1G K«Oa¬utê¾¢K­%ŠÂq‰æ”÷!%Ò´Å£ƒ„Óf¨àkôqÔ†Zòš¦I·¬‡w @aø™fdÚdzzØ@§x¨ ¶§2$%ÅğèŠy³ç°·%ö~›é/Ñ#öTÌ&RbŞ‡Ÿg’-*ÔÅI-UBÓ]¨:IYwï¥Àøb™~Óq"äM÷öWÇÓ¶´Ÿ \1¸ğ¤ù
+ÌÕ.‰œxÅèYx&½1'û&=š×<g®²›§Íy¶A¸\šŸĞjo”/òNî6xĞù³%óVèeV°`'x›Ñ¸ÉßlWÒ¨*Š-¦ëÈÆaz½¼qs`bÄ@@á â²ñe –dÓ9R.R÷³ †aË!K|S Æo°$è’CpJFYo0	Í5rE"(»åb!I2`)]Œv`Æa†:#@‘•
+¹"ø¸7Âg¹èééWÑ‰;ñh»RØ¶;Ğ†Ùí%Ó·	ò”ŒMÇIbÓ9uÙ>‘©@ñÑŞwÙ³¯íø[’}@~OK¹¤İ	²H.ÃÏ¨
+±!©cDNö|Dİ˜öõwzkŒ¸,ÒA0ÍeëãÓ]Ó~Ç”í2\'Ø••‚ÕB[X!Ù˜<£ıÌBÀ:ßWpùüÅY÷¬wØ¹ .˜kÕùã˜¥Oà/ ´h(	ÉÍê(™&ìDªË‰Ø“İ¬Ü!bÃW]—uU)ú¾&…°ë‡YÕ(ĞWgô–`”‰€5a•ôLÍ×î$ğí§$dqM•'É‹u®æ¬›@M`ñ	è(!åè«Ş?²Áøä	ô–`%J9õDé§M ö°>£Îg˜ÀE†,=Ÿ¯ÔgfÔv™.V,0Ö8Åß‹Ä™?†-cí9µİUó¥JÏ~áá0i[–¤ÖôÄ%6ĞÙ
+ì|¤‚§J£t Éã0fiÊ½»´«®yÿ1ğÉB#+L f®¹v(N+MÌGlïÕvâLJl‘¯Ò(”Ø£{ì†d¼š]'Áå"ìËŸO(˜	ğP•&Vœr'¤Óµ±®4TCåì¬ÏNxuı´°
+?„ºµ¿{ói`ùµ€ÔµCÎŞ†5>Ê81|Ú¹¶?ÑP¿rRŸkñZùvY#ë ƒ%•ƒÎÃ8îÊÜMÔ5èˆá¼8
+Œ"´,²]~ìr ³õ©k‚Å¦cªBe:%#ƒŸîU?T¹ÎEN¯î<œŸBşØÊdŸ _:1n6âµ:jÇŸk+mV3PI*YÚ‘Z– Ç:0¡­SX½Mî†¶œ"V}Ş$óôN$>/+dRÓÂcÕ^¯^Öì‰c°…në°wsÏ-¢BÚí›=ÍÍ—eFjéÑM:–ş:…g.Å ÔªÍ)ÙÅıü„Ø“˜½ÙƒŸ´×£q¡×ÛPVKÉÿ/ÃDQ
+--- Content of ./.git/objects/70/83b2a3c6bfa6c8d24f29c355853303d4888bb0 ---
+xuTMLGñşxÁ6MÕh’Ò6nV¤´´”%ÅI)%±iC.ÖÚ;ØVì]gv-`µT¨ªTE*· EH>¥T¹ĞÇ¦§\*­+ĞJœzê‰KÄ©ov×	úôö½·3o¿73û½ÉWŒ<¹:2rıšHt"¿ŠK»Bÿğ—¶DÂàğO†4\AU|c¤E~B÷#š VĞÄJJÿòä$öt™êÍ=¬S¶RCîdx :l€y‚œˆ†ø5D:Ö"«¢&8âS¤‰[Âªä<ïmÑ$?GvğS´%>Ã=‡'Œ,^!9’ƒñ3{şz|UvdÖåÈZôİv":ÃJìH™õä¹’a¦'WÖ¨aÚİ™ôLú«,)käæİo¿!vù~:}7MËšÓÕ*%ãäCÓî¸Ã÷^Ö‹Äî&‹óçùô(a|ÃÉˆ'i4_/2¾¨dÔ‹jù\ÁĞuOáH<Óë¬R­¬æ¬•õäŠQ,RæI–š¯POòÖ“5ëËŒ	äh>U2ª4Å–
+jµ–§•JjŠµ¼±œšcF‘©U35·b•=åÃ6g°¢ª—mÊRUUW¡’™‚…ñpmÅ(R+,¨¬åò+¹ö2Ù;PœoÂd`ÖĞŞÀ¥Féïaw`x}z}zgz-½İ¤n|4Px;ùqÆíßœºóyà›âDKœpÅ‰ıÄùÍ‘Fz{zûËfb¤•Y»¹÷ŞE7veı³‹¿Ø¸óxl}¬a¹â•C¨Š
+·¡t€ç:¼¤ ’	o‘L’I!ÉdGl„t@2rd'6Ê©¦)[ÑÓdë8M7ÈÂEN#¨Òn¦e´G äN?ÆkmÉ§kp2~€,Ş<¡"–\æñæjO"-~3áDÏÂ\€f^şåØA´„—Ğ²°€–p²k–ñe¼¢Ÿ›ºMûÉ¤³DS¡³-õÕ}¦‡ô‡~ğyßö{Ÿ?sgf”Ø]d©l•HMåÌ¿lG†ÈNÚÊ|iÄÉ­)b÷ioÀÇíŞ …,ªĞšßDvd”$%Æéî÷'–õEÃëH/hÍ*º'QÆ–T˜9Ò&¬×éR£[å*eüÂc1nâÜ$x.¦&ÿ&l#Âºù`İ_fHü7«cça–£˜8ö?¤ŸÜ ÒOzŒô™Æ§nOt7ø—JàÁ6ÅlKÌºbö "J_ã}¥o£¸Yo8;÷Ü&šÊdK™t•É=¥ë—Ø£˜{îŞ¦t{9ğ/‡ßTZÊ‚ÛÖWû±sâqËaâânß­íOÀ€î^üjà›Êí–rÛ=K_³â÷«×Ñ‹ÁÎıÂ‹á7z…?{%ˆg“¢—/7Zà?ÉÿuşµáãoˆõÀçş)cUC«Wè{Æø¥nNJï¡İ“z Jxè ½6]
+æ[<ÛúUş@íÏ×
+--- Content of ./.git/objects/1b/2475b2669c85b9a93df3fb40ee1bd198f04ec9 ---
+xKÊÉOR05gĞÏÈÏMÕ/*ONÌ-HJÍÉÑw)Ê/HÊ¯Ğ(ÊO/JÌ-Ö¨,ÉÈÏÓOIŠOÎÏËKM.ÉÌÏÓ+¨ ş/
+--- Content of ./.git/objects/38/98e92bc4090f673edcffdcf5415f2c9066f071 ---
+xµ“]KÃ0†½Ş¯8„Šˆà…ƒ]ˆ«(ø1İ¦"%]Nj°Mjš¢cô¿›¤Éºâ•¥Ğ¯óñ¾Ï9Í
+™ÁÙéÉS²š¥+)®4—xYI¥¿pÕhL?TëÁ€"ƒuZ"å$å4ÍÖ)ã
+RâĞˆ!¼‰¡‹Óë
+c(d£`M²aÑìMjYGÀÙN0Lv¾`Q#DOœ¢‰sÉNŒIfÑ<¹I.À)\>ŞßÂÆ•máù*yLœŒÔ*3¡‡>µqD1kò!‹¬-.òm&“j+›à¤F®³Âº)´©·Ç¥wî”Å0yñ(äéF	èÒ__ÍiûrÎáØn*Jò»ÕäEß%ĞAàgj#4/áÿ¦½œMÏÉ–Õ<Y@/ÏAöäÍ<~E¸²Ìç7±CÖÂ'×oPEÊz2ÜìújcØÇíÈB«u·Hv™şÆn± ‰S?›ï—‚&ÍN,~šÚåmáz9õb{ë“}½^"~­°Ò¸‹ı¥HØ‹öMQ)©¶]ó7Q°kèMÿĞßPC»‘ƒoNAÔ
+--- Content of ./.git/objects/8d/052072dd255a322875c5caa7089f081f170ee8 ---
+x+)JMU010` b…øø‚ÊäÄäŒÔøx†ŸËô.šâ»õ…sÙúDe•%Ä—–dæëT2¨ß]ñ¦Æ½nöMùCyÿœï?èÊılh``fb¢œŸ›”™—šŸ_ZRPZ¢WRQÂàqÃ9·—*N[ükN®t`÷»;Ë“óóÒ2Ó~ÜşŞËÊšqğÖí_R^ÏqĞ¹xjoJR<PQ^jrIf~Èni•ÒMisZw®´ıüÛáôÅüNBËMÌKLO-*fÈœæ»l:ƒH÷[ım¼¦gî:C—›Z’˜’X’_XTœZ2pFÛÜÖƒÙVmÛâ·9İÏèÎ×~¨êüœİ‚¢üäÔââÜÔ”ÌD°o^<kİ³iÏ?…E·şe•zÌ7»â ¨Ò| ôjzO„Ä¼l9Sûùx×É{[ı—A‘á±»Xêû,Öxgz^K,hÒE ö%²k
+--- Content of ./.git/objects/9c/9479a63636e0661e86d8a9f824f0cea411079a ---
+xUÍÚ0î™§°,!-IÚK‘8•íiÿ´ê
+¡È$Îb‘Ø–ít!®}€>bŸ¤cÇ$Ym9„Øã™ùæ›Ï“e!–hôåóø+¥P	İóoºZJ%Rªu/W¢D1Ô°’"oß¯k«$fU°åŞxË^/£9¢oF‘Ô$©¢ ±^AÎ
+šXpÒCğskN ö ÄÖ/‰¦v«sØey{<Ö†(£_™Yøöûe‚}@Ô¨Mİ.ìÏhß¤Šµ,˜	0øÌGº>†¢¦R¼)²(i+ğø£34D¸ÿÜ/ûcWQØ o)•]¸?&ø{’ L¢º* k9UÅƒ9¦o,7B2F_…3`–‡‹a“{_ÀáJ$TDQY™éƒªèèŒMW4]»÷¶Ì$ã¶#5:`!K“A¸§o‚ Ë(œG£…ß
+çç-'©ôácEeAR vâJ„Ç8tìFı2:ä÷4·>Ïµà´–])~ĞÄrÔêJ&ê…šÄJkˆ2µI€äé7Rhêuc{	ÿ]³n!Æi¤í°TŒ› Ç÷k&%ã/hÛti7A)áƒ$Qš:?Ü’]ÃïÕÊ¨AfL{‚ì}DĞÀ­İ½Çå$ ÜhßZ6‰èv×búÏËæƒ[ Ó¦û(5h £s6vYuĞ¹Ç©±0€R€²³ğ`5bmÛ\»<)½ái’– ›c·rR…™áZû&ÕnûÔ¸ÆDJÊ³ G‘¢V2‘•Jid«Ó>qsA&kq³kèÑâ5ûJ·ƒùìî9¹{¼^ ñzCä†ó«›§‹Å`×•úıó×±Ê¦Bƒ'l¸wR<¬òÀ­;LNNŒ¼;e¦[+³°
+ÛW"cùÆŸwÛvãfãb/Œ“¢1L#àY½*_á½ …UuGBáé±V¢i§¼ÙÅÓõãå¥’Q¥˜Ú«Öq«G¬UºrÊÉ<w¹ ¾íéÄ°µëv´x¡ÛÁjü×'Ì+¸…õÑtŠ>á²ë˜iRğª ß»ç_ã
+--- Content of ./.git/objects/d1/36c0dfea399f7b8e9fb35be7dc716769826391 ---
+x+)JMU022d040031QˆÏÌË,‰×K.¨,ÉÈÏÓ564Ô+¨Lf¸bğp»	ËŸÌç’³”gV/ùĞäQÕ“’Ÿ›˜—˜Z„¡« yÓâcû—¸ä¯y8´Õ˜ùJG÷¨®ÜÔ”ÌDœ£5VİóPÊš2ãÃªisŠÚÍ/Ï1AÑXR”˜Wœ†ÅÊ”s_n¾íÍø4ûÈLû”öW–Ÿ ’[P
+--- Content of ./.git/objects/4f/d1b0ce46e924fdf996a3fa9c6d1b518beedc89 ---
+xí½kwÉ‘6¸_W¿¢^èè ´IPê‹íág–M‚-¾æÍ$Õv­ÅE-ÜŒ$qx¸÷óşÆı%û<y©*”úâö¬yº */‘‘‘‘qËÈ‹áä"ûÃ¿{ùõÿ¶¶¶–mOÆó|<Ï&WY{½Ñ½œŒÇùå|0·§·J<Œ¦“Ù<Ã‹«Áõ´7+ò™=İ¶]•‰|Ï§½¢°RÃÉõõ`|=Ïö´)÷àÙ³çì­.fyÖËø8ŸeW“Y6¿ÙhÒ_ógîñ¦¼G;m4¿/E[İî¸7Ê»İ´t<›L{×½yò¢è]çE6Ÿ ¡<›M&sk\GşúÙ`œMg“KåıAÃE+{WÙíd‘}è%EÑ²Á›Ş¸?DÏ«òn4¸¾™g½~ _†î5 ¿Égymìb ãÉ‡Õl0Ï>†ÃlQäÈ¨‡>‹ËÙ`:o6‡Øz"ÒŸ=ëçW|ÆYèÎ'İ~oŞ»èyKAï²ËUÀ&s´y8ç+Ï2ü5ùJYW†ßËnOÿ´ŸY# …3q‰ñcÒ½a‘]Í&#ŒÄ#PÈ¸ÚÒšü³5».´v²‘÷æ7†èöè¶}9è1©Q#¬å ŞÈÎ0%îç€3¤-*67ƒKiö*Ÿó‹–q„ƒ¯@²}ô$Ÿ/fãÖ­¬D£†Zà:›\ü Di'½A‘G;/ó)gdƒ4A Ši~9¸€r<ôæy‚]Œû&Ã0¯zƒa¡-Û¼¸AnºÑêJjoË8–eÕZ‘A(Á·ûùÅâºuÕHåF¶5Ÿç#@†i}Ïò^ß£3Ù¼Ó~„Nî›í†¶9Ÿİ†	d%y_dM›ÏbÓjDìàJF*…†øÚAª.{Ã*ÀÛ“Å°ï›ğÀrå”ÍvùT1›`M³ìüá’Kup1ÌmLì3NT=œÌw9Ùl2$Š\¥«R_éÌqp½RÓOÃéBà¹Z‡·u³Ğ…I K ‰8º)627Im{ÒZ¹w•İeü²^‘åãb[†. ÉBêªE €È­SÅgB€óŞ<¶kd¾i€“ì!ø3gˆü'Ë‡Àór8 Oi‚ÍïäW½ÅpNúôOÓª¬&]áq©7¶
+¶ Tü	?UšJ¼oFS]ÃoJtÑÎ¶Şcí’l¬Î—G]˜2Şgc”-¨ÑuOFj‹ô<ÙÛ'p‹7Âï=ûW¬º½FY¿Mhó¼Œ¸·Â=¤“›	ÖáfæAâÜjòis5k'XøòC¹ö»Yµ4Ÿ6µ ¥ƒ“Y¿ZÈŞ4W@GÜ)ìAVÜ'È?N‡ƒËÁóé6E™Û+«í €”tL0}½áÀH a/ ƒe6)U•éË­ó:ºiìü‚Á¤#’F¹á¥ı‡ŞlŒ¥_åÃÇ†t¶«{E-éªyÇ,•‡ƒµ6ŸäÆYRÈûh’ Paojgg¯÷N³?ïíïg¯·¿Íö³Ã£Ãµ½Ã³ÎÉÖöÙŞw¬søİŞÉÑáAçğìÔÈ8I6*>°bN\IâãS±C œŒãVFµ‘EH„Á²ËG™ì.8ä ğ7€ ŒP2¼şÚÎ:ã‚Ò­|8ÖuèLBo1ŸŒ jö³Ùb\Äø <ºÁù-¡ÕxJÿílû&¿|g]¡“|ü~0›ŒGàÒej²åñtjò¤J	üÇ®	¬tÊû"X)Ñ ³@‘	Sƒ¢X@œ—5›A<–ÍÅ@ÎP³È‡àşy?FœèÖ‚6]Ì)‹ĞOùÿJiÿ;l¥Ñélğs-b5»XÌ1ÏcP;÷ú^v=™ v?ïLå·Û#ÊY"ºAÊ²@±º1*š‡qn8*}XğÈ²×`»à+ä¸÷Í'V"ëb%]çO¬tìXh¹ù›fö›l˜[FÊ+Ä ıp2 ÷õæ}ÖõŠwyå‰İ->›VXŒÓÁøjRejÛJTN•™ßMójF„á§âmÕ+Exd½RÖl&|·é1œp¦0kàK%Ãâ–€O²àŸtÎV“ÇœMş“>6¼nÚ—ôµÁ»i_|›Anwd$x++‰ôšĞ0‡ƒâ‹¢L“ñŠš‰r-LéÔñÓ2T¥ğ:‹vXP~·ñÿx’mV1‡“Ùå¤Ÿ·;'İ­ííÎéiw§s¸×ÙévNNN"JË|º<Êò`Ø÷«`KDw,ú1´9ã“œò²UOÓ«ô~™·lšÏFàBPuéRd…=ùğ“F÷ÍÖNwç›§«¢.×‰ ±¥÷'à¤iÑ¦>âí“îöÑáa÷õÑéYĞ•Éx2ÔÛ½1¡s+Š<•«Äó7›y«ËZ æ&)Ÿ«Á,ÿ ÎŒs˜'['Õ’‡	æÉ0Şr*Ê$Ô“|M7g„®ÈİK¶%íH¹ZxŠŞUŞıÛ"Ÿİ¶œ‚¿šÉOÒ¶‰BL;«™@6›`ÓÙyR>´˜èÌDóqûR´ú±õf·›g³E¸‚¾oçóËÅ<o%]’ûµVBY šjÔi´-°€Ã·„õ«i‹¸I¦¯@\ ;ƒ×ª{s9œÀ”wAƒôUöó/í”`lÌã9ö€¿Œ¶–¼_Ñg•[‰¦)657d‡ôÀÀëğ^2©u[6ZÓiXÿbƒ¡2›¼‡< †'q<d<sEÔ–nY¶
+ÊÖ)bPzÕJ¬7®`	SúÙÈÄ~ÕƒÄ“Ê¤UßB¨&Ø¯Ğ¨ƒéxuJ6-#¿€N£@ã„XlÉÄ©é|ÆËî!âiŠÄ$¶­ˆnKäè¥KìÖ£Ñ`š~nÂº>ÁlCpÛ/¦–Kzç`?›`+©È£b§¾ZŒe±QÅ¦ eä‘ß”“—w©?‘	Ø,ÂH–bfív_…â)K%š“Ùd8¼è]¾“Q¸8•ìˆe8åaUÖêp÷t€V§	¦nX‚•ö²;ı¼¯,Jšê¤»«Á3%KâÙ³g÷„c©“Y±^æ®tTˆåxÔÃö?+ÚbÔïºŸ™sb ¬"ïB‡¹oŞ+Õ ./æ“ÙÒâÚÁ|ÖWPB]“Ùuo<ø¯\ì«ÚÁjGÑV°bøÕ¥ò<ëvàÆÓ¢u¿;…M½p,H¶ü¦Ö^†mÍÆ.rúü&,Št(-«
+$€KåUxRQ¡T€ôq¬îá½ìKµfÚdüëŠ.Å…ó,=Ïê^=3¿ÑÄ{f¹b“–ÏĞ7²í·{{¯¬H´OPUF®{€ÖêM§]Ãj'°ÛÈAÓ)ˆ½xöì`ëøxïğÛS`º¾¶5Ùh`èŠ¬…zh¾¥î,¿„¹+ìô2“*m:2ºBòT©Ûçõó	4Ôª‡õ=Ï?Î×”h±û(3Æ– [³Á€İ•½;eÌo%•ıÎö4»İ“£ƒì. sŸıùuç¤£4':şfö¢P›Õî$cù‹+¬„¼¯"7n)P+kÖ3q¥|AI$°ülò¡NñL‹e yS†DÑ´/©	üm—“áb4"÷Šó~^\¿|+œßÅN£Òk‡åú6Ã>ñÿşßÿOvp+–Ø¹ˆ§Çª)ƒµşk0…[%ô´J WVˆôS[Ş:Ü‘†¥M§^-‡]Ç†!%yÒ§¹*W0$\€…ÍÉÄl´f½şø‚.
+H§Æ®bGä%L8c`ôî^"da Å«î»üZ÷Xcšk§=€K«h9º'JŞ÷†‹MÄİŠÍÙÚ		S¯¥Ñ^«ÑX—ÄjÖx‰¿ù/³/xÙ8\ßjD±3®£ÁxÁœ¿ø—¬¶«ÆIïƒg…\L9l”7cèb1¥Tı Ø¢TÀQÓ—àF-ÜRû«1{bXS±duİyï]>nTIÜĞeü°]Ìg ÖQŞÂ—–¼]9ßxõ/oáæ›{—y«±Ad¬áŸ/VğåÅ÷k/Fk/úÙ‹×/6^œFÌ‚ Šn›Às5ì7€òŠk2ôíïC>k­2¬(ãì®q›c…Ÿ¯÷ªF¼ô3Qßyßy0jú‡cPNçZovyÓš5Zíÿve#úĞ)Ùd ri¦Šh–¸ı£>úÀD¶ p= Óöõl²˜‚Œ«²šÍÑ˜í—¿{ù2ûm6Â×ßñ‹Šs,eUİÕŞ<2ÀG†ÆVK|ÎøXÏÆX3°2Kq[]‚ÂDÎäŞÛÒ¸®Q/©Ïò¿- ÿÛâ²Áğ×5d_ ±I{¡Sm>*Çâõ,Ü¦±şv£Pc…ºñ¤hSÌi3ƒ;UÖø¶áÖŒïŸn1nOÁ—­‡cƒ¼„0z›ÒˆÉª
+‡ ÂìudÇ*™Æ°YÍ»ãœÌ¼N.1~OÑïç‘XÖ=»íÂ?±¹‹¸H+µÌß17`Óä%ÁdÜÜİ½®Ûeè´ï~“ñjínã»Ö–J÷Ôm_Fºÿ¸Z‡}Ï†1obùµÊXJÍNÀ½ˆHqÊ*D,TgBiW…²˜\ç-G»£gBë5eô¹±aå7“aŸØaàŠmÿ0Œ[çÍEó­³×kÇ•¯…’W½ÃÓÎÉsgG©Ô×ºÍ8PWîW²ï¶ößtN³Ö]ÜçıJCÇTBÚı·¡í¥bßq“ç†¨Z)Ìƒ#´Ê8ÀÎÉ÷İ“7‡ÙŸÅ%¬“‘ªÓ¡ÄÂO@3¤óVÓó‡f¼H¬…‰İ‚¬­NŞ]Y&â²BIÌV³ùb:Ìu?.j¶	p;êìŞ"‘ì‚lÓ!Ğ¡aOˆÌoÉÈc*—EX7l6[æÍ%“[Ô³É™Úµ³¼U(Kh‰È’‹©ˆ.b>÷úÊBAÒµ9è“ï¨Ê¹J‘;TÀüÆtÌ\“±,ƒ^Òj ÉŠü‹5 B29v¯ÜkâßçRò-‹µhíÀ~YrHV8ÙNçsE*«Î¼™à{¤4;Ú³µ‚LÿŞ­½pTÒÿbÎ‡% ÓÆL,sçWÿñıÿš YJ3:hŒÄÁ¢!.ÊPL8¦{ÕÖ§à… Î€´‚q¹7Ç;[gƒŒ›Ù}vÚ9ƒ7Ó³JÔŠi¼îGTueù•xY›¶ú‹°6‡áD/OP­|é~Y‡ŒCgÈí?©$ùÀ×ŞÇè§Óö‰£&í}:[Óc¶–tëùZÕ4‰Mx-±IÎ?Îãèé`Ëú¡€ÍOL•Ç{ûfsÚÁh¹Š²ÁÕYÆ&yoÚœ²ßØG Úõóá¼[„‹©ö´îüoı‘Õãw³©‹¦=A¬ŸÑÔ.8mßpS­!Ş1—³ëÃE$–ØE:P]¶è^k£¸-\u0&	M…iÙ"BÕÆìmy\P´kwö@]Ã´›;\®Âp¤wº4ÚIÍOìZY‚³‡XïÙàÖñ^†8´¡ï‰Ê|ÛÚ¨÷Å^Ÿƒ-¹Wàb‡“lÑhÖz(¹²éÖZd²ı½Ã+n†ùGÆ°»@Ü8Ğ·€¡uäCbg÷+Ğl˜±Õò™£YmRîÊÕíÕĞ'´PPĞˆGÆékÛ"¿JdW;;€© ¾x06K¥Û§€Ö’AkPe‚;	^àÇ·óLšè7s`Vá'„kä›ÏIÍ>\_fDèûøõÑÙQwgïL³¹>‚ã…´9è­ßLæ“¢ùì»½Nmïà2co¾İïtÏ¶şØ9zsÖ=9::óíİLFùúìÃeo4½È‡Ãõù_L>®_Æbº~†ANóõo'“kÄkº.1a{ÇG'g[‡gˆ‚ê¯?(ş‡àT’¶ )*øN@¨o&Ë"ÅˆÉêê
+Q† ~ˆ]ô†º[}zùœ(ÕÛÈÚãüj5kCƒÄ¿}YkÀ%]À¸ÒM¯åßœ½‚å¾¼f-ú'ÅÊ³½ƒ­o;İÎ_Î:‡§{G‡§ÀäùéµîRÓ\¿LÇúy=¸’óğ©nòÁ¥¼ù_Lå€’O€%Ÿ ¬yïf¤Üßhú•”MŞËgïı@¿Óßht¤`#C’”¯qÿlk¿{ĞÙÙÛJGVl{1Æân)•˜è{Ã72`JÓY~ÃYB´aq‰ˆ,eÎ¦_¼ºüİie‡G{‡[g{]°†î›“} ¶q3ŸO‹õõ±­ú6<zcXƒò|İµ7Èú,*o<-¼ºÔÅ4±‘„ÓOo×_µ_f­ÙäÂèôå^½üúÿ¸Æy­4R’<Q#œîİ²úà
+ZÀQ›³FÔëNgëûîi‘;$‹WíWhé`0Œ£ì#O'Â/‡½[ÄÈÏ?ä9}é·˜á¬ŒP4 nö–hÛvˆÊE¥ .CÔö£6„T Øvïp÷h|uÌ—²–úÙûŒÈF™L7ŠBê )šG—ÚCKÛt\¾­)Kßl¾hõ
+¸ÀFùJ‘­e/´,í*î·;Ç³R hWÅ0 Àš‚·_>„AIíXÌ®sÌ¢y¸¸I_pPvugr”cU'<ÕÎ!.ĞXx·ŸC¶‹üßvÚ£ãƒª5¸5åfrâÔï¯^õ¥Çl2ÚqWÒÃ6Ú@tŞÆGuÃf¼ú–Å'³‘U8°¹›ö†hîT7Û¤-jÆ"ÛyÛùeû§j¡Íˆ» :+SÚ0-şİ´JĞBó AF4Åh‰ÏâıVIizâàFaöÀN«{š)‡¶MÙïšÂß›"N`…5±j¼†;°æŞcû‹Èµ#FÅŞ‚cªÖÖƒºi˜T”!„ı.âs=ü ­ªÂ¦tYƒrüH kÎ«÷´xDE°‘*tA[ÖX:ß ‹ëŠñ§ˆ¶a¤sC¾JdMDŒy3"mŞU ÇnŒá˜×âÂàb0Ìoªàûƒû‡³4]UFñ±6D‰Ÿ½Î÷¿Ï¾È¶N¾}#á¾%.¬z –P]3éÒtCÛ¬Œ ˜æz4:2	‡tUõKµb×2ˆÑ8\Ÿ&Ãƒ.òœ_ĞeÊÙ&§ºÀ”æ¡DÓ†éI8ae8•$n$œn)ºğÈÁ¼ ®ê‚;›­¿m)àA¸¼p¤Q*bòôÒ¤'%0Ê-BEíyú‰1-°à,am0V<m`dgXˆ¾¿@É>ƒÛ9ÂåØŒˆ£DÙObÇ]Äëˆ,H¢ŞÙÙ—)t#„?ØÓ 5ËUµ}Ò¡Eálë›ıN¶·‹cgYç/{§g§Ğ¥,ú…-&Ölëdä½CT&ugÇ'‚N¾ÏşØù>ëöİÖÉöë­“Ö_½’½9ÜûÓ›à]^Á¹‰o¡ƒlî!frç›l§³»õfÿ,c66ó«?Œ.¾Ê¶ö÷§ıîBÈbTm÷rğ¯ñ°Bïe„äG¢¢›*¼‚ˆ‰ÇEUàïÃ)
+mœú£0Zã°,7ˆ	8Îøº¡Úğİé„'‹qÈ"IçßzãKÄÉ‹ü£Ş$§te…ã²>ÒJÕğøĞ1±^€	<qZ¨k¤
+õ¿5AŞï ƒ¸›¥—_ıB>u#'	?Õy#²°]apÄd1ªWÅ¿f˜Èhcê»_&öåÁ¸Ÿ„ …OÄ•“71;g{‡ßƒ¢ ’ù¹f1)ÛíÍ3š¿  wÒ"81|$q 	X’Ğ£,ø“Z¿ÿİïa`ÃèŞ@^‚~5øqPrÑpT†	7¨áaÿÙÈõ‰sœO`pÿqS	±¡ş²Kó©c}ûÇÕ»E’‘¦Ä#eÌ]ÊÉ2ğOB„9q/6}©¯_®¤2É¾ÙK;K_Ápæ‹~í½«-½Ù-Ûƒ	biUl!.ŒbÉÚ€
+‡ O„}Á|â×88q
+•O>P¬¸YàÀÜ¬ÓÖ®5WÁB4†0èĞa¥Ä ˜,¯.¡gHAòTİª`?K!€ıò@ ‘{O©– 	Ğ7R-s9˜Á¯Ş\QX»‚¼N½§¿7[˜r©tëök}£»v:~–&†*”mæYËêÃ9®åKXÜ=:éì}{È?^ÉN:»ˆ!;ÄqgÃjú+ŠÁã÷;7¶·N··vJ« iËº‹›’Ö·ô«™ŠcF#ıH©iRŒ83ÊFœÄ´Jäş°{ÁÆs*6ƒŞ4ƒQŸ»…qg{l°[£§ÈÓ9£5…O´–·¯Ûp ±úiğúĞ»åÇ,'ÓšŒ›IsıA>nuÿ8ƒ+nK›ÛEìf³ûåf¹ÜA—¤)y¾õPUWÈUbK¼úş9 Q?Pâ“˜®í×±še"Ë„dË±ºj¥ø§¬g«ğK-hß_¼¢eµüÊ—´Úõÿ)ˆP]ıe‹‰¬•˜®xğ¸+ş²ZêW##¤›îƒ¢ÜßG¸úÕ°=ñu…M”Ù¾ªVŒ«Tb"ÆX8‹H>ùÛ³Ò‰ó8·êYU:É‰ãûû‡c{ßæ˜X`aØî]B°HÍŸ´³¦èI¤›ôUU¶ğÔIåZ ÊûËÉ¤Œ<†âô«`.ı‰7ySíä”Ä`~€`B5…ŸÈ³x 8¦RTTPJ	Ø1ét“3}	>Jñ³`ÛÊûë˜³K¤,€	UÚlCjC†ø¶“‰S!·nAŠì©ŞÚÃÖ¶Ä ÃğãŠ@(„¥‘Ù¹J&Ï:ğ,ÄÎ™†ÅôFÃ0¡ï_Ç"ºÒ"B%Î½«O¢Ä4¹éxô˜æ¯N´e×HÜ’kêª~Ñ˜dËÓ€Ÿ2.‡êøÄnb4ß1G‚Nœƒ‚Áu±j.	 õfïº½¢ëXbjÂ‡KVç”§Ïì¾^=ó&f3%ú&ÌeU6î	(¿ Å™6Aç¥£©š†>fÿ¡Á´
+›™têÕ‚ı„òKToÕÙ;ÿâ`Ş2F‚-ÌÜÎëE_ÁÒõc‘¾/pÊ^ÿOßS+}s¼¿·M;8õXdç‡»FÛhùGP üwr£j‰Œo52B®f<Â.ù:äô_Öb„ıIˆ ¬’³$(H]ˆ.¼öc1ë;(|,<ƒZĞ…Pe%AR„áFNqJï*´ã¹?!#°Âi]Ï `)s Aqå.ƒ/ö=zŞ–ş¡ÁÓW©$’3ĞÕ•ÊŒ:æº`H‚Ÿü_ëÒŞ¥ÀU¼Û“Éş' ½Ë~AÃyDüƒ<bÆ´šÉáˆl‚r³8ìü„_ÎÕ Nk{é±3Ÿ!4¶IE+1'ŒBkö€p±ÔGH-û\2V’‡"¶|Oeş\È°€ï.‡ÇFÜ7ğa°¼s¨ ( Õ`”Ã|Ê÷qF­ê\ô”™;~êéC¡–yXtUøª„ç&"
+¦×ò`1®¯´ÂC¡AÉ4P3½#õëyÓÒTá¤~eû†jW¥Ç¯kŒ¨¦mf¡aeÑb×'ù¸ƒK)ÑfH{…†€{¸Ò3ûOZÔ<<™uİô8C¡íÁ”î%äFclgÁ"˜ h „³—ù…J™¸*E¦!Y4ÅÖèü…ˆ1•QpAıÄŒÃHÁ’fÜ´t4‚ËJàËÏá&†eôz´WËo[*Û>€“~ê†:¢Ò&Š$(pM<–Sv–#4«.&Ym@ŠäX€$ŒY3ÙMPi–#€ó—e+K–-4L96.“ïÎ‹2ı5òZı´
+BÑ™FÀ”vgMª*AÄÃåÊº>oúÍ·†16ïüÄ‡”¸¤ş%Ü@kùÏ³tÂnù€eüÄ™"§E¼„cT/Šqêğ£MÊ±ä	ÅŞ–p±-ËMyD8°pRwí3G›w)×öHaÇKúL{	®©A¨ö‚:Ëóìß$v˜© İ‘y‰£f;ñßóì5µìm¤qlA}vOÆëêŸæŒ)´çˆ?œ¨­=‰m•ä'ôí³Oiª ,Yß«Tv84O@4\ÚĞ­ÔJuÍyL¨Mx|Ñ Ù	$U¡IñğËDäöÆÏ[dÖ°ÛãÚ­è’Eg¯Z&V¦º\ìMi§y
+ÀçÂvá×peÑf½+:0ÄLBÍ¬İøS3qEI¹0"Mùˆds{;ÈÇŠâ‘\0‹$h¾ˆgnÉ„ê÷|êÕ¢Ö‹d‡ücÛ"‚Ğ‰©®—QV‰,“ş8„zŞŒ‘ã!^¬tCp­ËÊvÇ+(*K†A‹ôøÈÈ>Å`±l@¥(Ğí¬*„;ŠXsy•	…IÈ¥ùçzìÈØ…46øÀ/ÄQğMÛÂ„[{’!¦Ô×!DƒÑ, ƒ¡7Æ·Qp™OH1°óãbÖâŒ/W’¬_#ÿEŞ–×]Á`±]	ds‰÷Á=åÂüu=ùĞ61,Ùl#f‚– )‰Yûñ…İP¡@Qœ=4ÀJ€RÖ›#š³²‹uÇ²È³LùÛö(ÎÃÁú$´y•äÀ(¼Tºš½Ãzí#<&6ıÁ¦öÙÖ·§rUZÄ?©q5ı‘Eê‡ÃÿÖ°£2;˜è‹e$ß	ŠeFîcÎëXšïğEâ1YîZä5ºm¹úerE(»TJA«¸¦^á1Q*à”Õ	Âé†JLŞºTCK\°v^ÖU®'¡Ë'ã¼i¥è¶^ûAşã_ß×[p»5=z1†
+2cĞµN¿ê0ßŸz„ø&-k#I@}ñÜÀ”-]Ò™.æ’§×pàÆ}]©”¡öœ ä99déõ‹–vlí‚Q³ìƒ2b ÏÖ­Ñâ‹T±˜,He4Ø>¬¿~°¥ÙÇ‰ØR³’çŸ+fIÛ®]·4C0·9ÍûÇj¨Sî)BTa|>€øæY:$j‰ $:b•bkq-,‚öÿyŠ'²ø‚¬Õ6’éÄ;F;¨.Âå«€¸¯ß¦–a ²WJ$¥QøÓ{–õçôì®0Ó‘ì°7I¢ã2$Weå\F<¾.Ld8Of«TS–J.¶bİØ¥NL×Õèc	âsz´êx¿œnlã´Ó&g€Hì-Ø	]İr™²OŠ”5e‰Ä°arU1‡Š
+Xš–‡z’Jé©Š‹O°N’|JktO¶×h5xÓ¤ë‘)€Oß$Í[Ìty$§À]â7óUprö¬Ó˜<pÊğò¼1ÊÌ¤¬©Üôyf*é]Ü£&pÉ‡6]åİ½¿ÈR8Cd“¬é¸WŒxjBµj2‰¥$€¸-2Ê8D«×Î.1sEÅ¤æ.Ó@5]êvŞÒé 
+¨ ÇK@‘T–Å®³‚!q’“Â4+…¶áPÁöºlb3{‰>-b$ˆ#v“«+-jHšt@åyF!$iyÀsäê‘–Iÿä–3ÇÆ?”n1~ì{QQª¯.Şo±_Á6µ…tı+iœ›Ğz
+ü+†äÎ€CÔ¢	¤®°ÑÍWªÅdÿ½$4~ÇÑ¤ö‹¿”é‚V³wßÇÇ¿*€Jdœ#…p®¥’8á„µAe:“”‰ù3v¶ kÓ‰^Ë#ù^Ó”a¶™—8ê¼>Ã‰¿£Ù ç»{ÈiLRIË¨)ƒ%ëŞî‚KÅ%Ê½öI9¤yğRˆ‚°ÈÖDÇ<aç4æ9|ë#¾ÇßÆÁÁÆÎNöú5¿œ†Tˆ¬õ"ğ7ñ„m×eb‹JàéÅ÷/F/BÎ5w9
+›s[àwÌ£ËU†ÃWü+±¸pÃ’ägWšJ?šwx+âTíìĞÉÅ be1÷c7Ì=´œÁt«Z/İê@¢Eœ?c6çô0‹H3…Ã¹®)ä•$ÒğP¢»ócˆÑl¨ÔIN‚ô½qÄ¦+c¿£r]Œ95'C³Ç(cÖÿçA~ƒ4?ë^¾ÎùÄ$@\ÿËk‹’TóÚêkÚ:â0Áí Ë¸?X5Ÿ‡lSÓ´à”O»¨½ïbá›I‹Ñ¨­á_ÆU,šª®Æ–šOú$‹*áG·”w¸pÔÁ§1?°Ã;aª-Tõ•™¤ éÑ
+3®¾ZZÆ#JBÀPËçS8Õ|XÊû²šêxJç#xÔr¦&üÊRøŒVj)ÂıkAİ=\Œ.xER•%n¹n5>½r-`8_PÓŞéQ-BäymK²Å -¿ÕD":Š€)ğ€xÎh§$á&T*ìã@ÂŞNB=R”gj'Ek* ’ß7\æR5É‚u‰¹KURëc)|®»ö“¯jq"^c éE‘1Ql,g"i‘yE­ SêÅû4g‹‹fj-.J“Æ<ÆdŞüãş.<|Ğgá°}ò¥½Aö•…J>–TUGÓ.£´Ù·øÊş\É±h@ÌÒäa°ü_P A'ˆˆ„­Ù™!÷Ó˜ {mìOÖ¶xœ«cüˆ§´U{B^ä%\èÖmõ»j<Ó£mÊZqß£5bOÜÙ)[¶§{W£†¸åM¥²:Öáa`ÛÉÛò•(5O\R•Ó¤ä töÎq.ÂïÑoä%‚ó¦l¥g6‰Íòs›Íò›V<Œ0·ålJ¹•zµW²ó”Ş%ÓşXï6÷åÈxKí*-=ŒÈ¢\Şä#ã÷DR®_C-¡È Ÿ 5rãršKr¨¦Ïêëc©2ë¸¨%*t’	án¨½èËÆ/îWb¡³ê?RgÇƒŒ#v¶:îQ%HBëY¥cŠGU†xIÛ’ª„ÆæÑîéO†$"´Ÿ	D›nk‡wª˜Ô7,@B>~(Sp_¸ç¡Ÿêñ»dòdì‚¶ø¾óö¶ş×ˆ'ó1®á'+Ğ¢²yaSW~&²üÆñš
+Bb~ôcxOÂØ) Œ»Œ¥±½z
+ïIz7’z¬ï_+ïIVâ8Æ7°c¹-	¶nHª•8Ó^œ*UÚøö¤R`9´œQ€Ç7{Èœ­Æ!Ïë­İ´F|ryÉ)‹6|ğ´vXÿqE;—)ÿ‚ä¡÷#D6X5öFÖ‚%6{/2?ê€¥ËuĞ•##Ÿn_—jÂÇ?Ó¾®§R~¥öõ0ºO·¯k]çF £üÅìë‚ÒØ ş“Ú×e\ÿ´¯«©÷Ÿöõàø§}ÛvÁÔŠ"–qÄÌí,±Kdul>¯Úšv6{Š`AèüıßÅFîıÍ2–rP…œ_bt/ròV$¸´Ôn{h5Ì¦rÌ!íïÎiªfayüıÓfşO›yºÄ¬ÍÜÎ‰Wl¤;.db'Ç+åwy¦üDMĞqš‘–Z©ñ«±ñFğ&ê8 ş§áqÿC­áŸÚdú~‚(-¿“¼H»ÅÏ`’W®¯Vö ÜF‡—¼æ“|\85ÉÛ4a_´Iş;9Êÿs˜äƒD xaÂ÷cTUÿ5;Èƒ6xãjÚbkÁ›4ßÅò†#Våª9«ZüKR^IuöµÀ6c¡k,á3î™jÜO¬ ÷-8*ùÙLöJ.˜‘ŠÉ>~c&ûøYl6KG&ûÊ8â‚h‹ßDs¿ì•™ÇâjFu°¸\ “rëmT^©éµö±8kL~q§5fÚr[F;åç	áåƒX5ê*7âÌ~1HŞå ?Ëè/U¶ªYë?±Ñÿ;åO?“Ñ?gİdP‰–MıF†ğ7x~´Ä_™I6í]6µ¶ıÈñ°SA}ñ•~jW€¹~R—€’Œr¥Ä%Py»â—©K ~³Ì%—y
+oK8V —òº‹å±¥kEámIÇÄÊ§¼¬BÉpçmI§õ¼ìÁ.ÊÛ’~>—%0”œ:bq{¶AÚøv÷S9l2ĞŸÏ‰àñø˜Ã@òS:$"¿{A7"‚åæJõœÈ‘Zç=×!2_=4»ÈÆ6K59:‡ˆµÉå@²42‰¹‹kÕ4;şğDmÆBKSAÎ¶ˆ[5×è]cşBÅo‘â“éµœON€É>±ğĞ/ó{¦™Vp—¢l'z‰wÃê|WHªŠõvÜ$~UÉïâ@¥ÀˆKŞ°-$¥áX€Em&wˆ)6ïÆY„¯vöx©Ğ-ÏCò~!I¸|5˜áv†¯™‘^š<ßøúí}»ûúÓˆ$¿¼m•«Šì ºB‡$V6zWqFòÄÓgıº*<Mô/gmk›_.€@ aš;Jâ’‘–:ÆÚŸNf8¢‰1¦@Ê3—FXvşŒd®ß¼ù©¿ÍNÏ:ÇÙwx»ºÅ”qZ£•Ïs^n!g]Oâà´u™ë¨no’¡µî,ñöÑäÿÍŠÛFİi€æi¬ä¥†ò¸É ‘Æç¢âqÂ(]šÁBwûugûÉ‘Ä!a£%§ëä+N¸^ƒ@2+ƒmç0Ar¯NCˆyw<´|¤]Â¯ÖWià%n¨w6hQ%..A°re!8‡Å#Xt^^‚¥]MJGß„†CöŸ¥ÜzvïI®Ü·È4?Ã>Bil “¸º³  aˆcµ,æCJp´ÜÈå(CWüÃ`®JÊ«œ,}Ö©È1Üt•éÉt{Ğ=ñÓ¶©óĞö5ú“nq»zv¿=˜Î€ó—
+.o”µUÆƒXŒFúß|ÃHFê(Ùvªü#İßkÃˆ@ĞÅøßjÃÑıJ7Œ2lÿ€FrÄ÷ZîŒ”³j8¤k]6_½´+”-ªÑû„k×İ7é®ŸÌä¤3­¼»¤üÕ\&Ñ¦"\š‚#¯sÍ bŸü`…Ûr%›Aö‰5´É¬'l¿@üç;
+‡x…íu<8Ys*÷›4éIïi¿ØiahS¸êr<w74énE­«ªoU ã˜Jú
+¶¡ØI.z+$_\‡€Ó¦Ù¸ú.ÜàSÂş/ÂÈ.Ä¹êÏ1';œ
+g‡°à§Ç°­%wF0$!P©×ÙŠa¸Iµy·¤I»ëO õHé¼í—É(DßÅz’
+?ªkÎá±vyH_îëáãçš@F«’îIg
+hçÛ$¿D°5E7£*Bƒn¬t…|¼P›³(ÊyovyC‘yJc‘“U˜æ¹ğ5ä‹3XŒptªÀŒ2å&Ã¼¡€ãt0[çéêµ4ÅƒÃkâ[p>xÏKã²µy…Xqè½Høªä@h¡}è“›8Ø'à£O´ôWÑ_øºëx»†¾.‡¸Cf³ù›61ÖDoªd®bZ»j¼á~&X”qs”3\ê¿ïA?‚ˆÃgŠF¢«¼,7k&aeÑ»ÂYZ&ÖÔnšMÒÆébA$}A1%-¯ÿm4Cá`†#Ìy”1‚¹6¢Z1lÈ»ú98=œk€Üï‰ë:g	`’9à…8]FVæØÁ‡ŠØ¢ıaYúrr¨Y¨ÈuæVLá*)«X]íŞ”)Œ[¾½Ğ“ï2k¡&7Å¬1}TÆMê!Í“°iÇ‰eŠRæ–#9Í,šŸ—ÑC@u¢ºYTÊÉ!¼RT³|°$'J´ÍJãi$š”œĞÔİ¸¯ˆ6Ç%œáæ@¨ô¸ÙmøNˆ ÄütCÂ…­8šÛ5ÉÉI\ĞÆ­ap_i
+³.P2Á’Öë¹z£rH¹¼‡„ò™\²ŒŒoz#¹îjÖ…r$»-7mú	Ä6d€¨)M¤¤Ë"€‘ozæC>k­´AZ'¼…+™ÉD4a’ ÃáşÙÜì/£n3ÚMØ°ıU	Í(Ø6©&ƒ1®æP	Š³^;ÒÚÅ“ÃÉ\’ŠF†„ÒC¹í¬£KMÍ  IgD>^äBb% d§<Ş:{oG®_‚†şÿ>áŞlµ‘}{Ò9Î¢m×„«áJ˜“qª„U!—Ày‹üÆV³´uièbtÆHĞ¡Ïe¬"ˆäy§# ÍEJhÍ%’‘¤Á1^FÑ÷®;ó«·E´ãª œ0\‚kŞÀbâŒe¥`İTQ”‚Y~ãö8X›e3á²ïªü#ñ˜Ş ÊÌ$Ûb¶u²óÃ!¯¹Ş7‹ÁÜôú©t®Â?¢uaãåıS#šÍuË ™Kw\ëš¦ÿ­?jUgYĞóâr³qÄá3
+uojDLGí·?£A”È)| »/A×ÔC3$<Ah¹Öb³‰ËE×ş@ş‡$`²Øÿ¨ƒ /DÒvµªÅï¿, c©•"ŠŠÖ´Õ”™Dú‹¤¼£ê´Zµ_Ç,œeòQò¹K{Ï#Ş™ëĞÊlpÀr>Z	>¦'‚Í?*\ƒ1òD& êúÔsËNÌ¾Zü×!M Ìø:Ã”){×ÔÕ€4j|øà­Ñ&]ïüşe÷Õï÷/íÃÎ®—°µO;DKwRl1ÁoBãœÿ±¦.HÀsøÓuPn44@PŸÃcÓÔŒ?ñäpn©ìO‚ò¤\¾QÿOÇy…z‰,™d?—=J©»¯4ó¨ã·A¼0¬KcœAA9İf#P’Õu>÷=êÂñ?	@‰–Ù¸´÷9H'º7¨;hïK0¤8‚”¬Û.Ë`A²ŒÊ*BOÂ,@2Éô²I:„6ÜÊ#‰Ô ¾&ãøé¼×’®7+ÀTÁç	Mÿö)M'€;9¦’Ûà‚KK%Ü%_Jr&ë‚ù‘ì£f¼IÉK@ÊÖ$›¢»UY<A:	*C’è„±rBô\Xb»|Ë3Y¸‰[@ÌMêÅÆ#eK¾oŸIùçëâfÑ_•¬iğ‚´ßªx;_ÀsÛÂÅÔßvº¸¦°sx
+!ã´œ“ŠÃĞÛzê³8”’“¡–µù%ô—½`ïx4$¡)X3HeßtÎşÜéÚ›RŠ6tt²Ó9É¾ù>Ûúæ´…»	şÒåmÇ§g[Ç­ĞµÒ_’P!kïïìeá$ŸñÏ¬QúKÿU4{ªà€É6ppWfõş\haqrÕµ´ZÃ«JÁ)ìNù°,{,l×uğ¼V‚éªTWÛŒÈ6*[“«ƒ…ù—ĞrSêTS}Mätdš@Ó'f’! æĞ#"í{àÚÍEkäÌ0&Àù£ŒFr5#™¡Ú)/Ø8sÅ¢jŞs$£ #ïhc–ØØ\n]À3ÀFÃÈ°aV\öÆíl/‡RLY;ßàìı†æöÅ;íTQŠ	äã>y}··Ó9úéVĞwÜX™ñ® '»Èf[]Ú*ãÒ
+Šª<º‚¢²O^ARç©+H
+/YA	1TSff?Q(>ğ‚0;]÷&Ã~í’+ö 3^N®Çp0a4“Vcq) ÜñÜAm!ñÓëµÙÑn¶ûæ?ÿó{¹‹;;Ø:Û~ÍğŸ†Ğjañ‘(dƒ~uz~Òñ¶ÈÑ7€‰:ÎıÇ³2*ÂÇ²Ãßi²†±P©Â[îA¸Î`|ı0v’Å`½ª«MôD{D[Íw.Ÿ·4šnóÆ5¬ìiöIÊÕÅ¡Öœ‡,©Ô;ah£+Ms0¥.°l.\§ÃEhÂ5>Z-~Ğ¨ru­¬ÃÎÇì¦Ë®®‰šZÉj!u}ºæ"+³u@m¬X\ÂÒ^èex“úÕò4çeŸ†¢Šy›À>i ¹|@VS÷]é]Ügf÷s_ıQ#X#öY"yÜ	¸Àº”.*Ñ,¢K4ï"”aYk"‡‹û•ÈI…c¸4¤mkH˜“1ü’|¶fèÏNÕ
+ïR±Ê•v~F[ªG¤²ÈÇ)åäwµà,GäjöR.ŠÛâ]J¢uK$¾óSj¢T\'·”~âzl?¶ËƒŒ±]~'Ø^:ˆç.JS¨ô°ì7øõ‘”2°mL¦ÈşŒ˜PÈCd.ğãI,b;Mİâåv€ÛÉóşòéÅ
+©%‰ìß7Õé+~ã‡§9ì
++§púğDK.‡†SX.ŞâÜ¦6Áñ§ƒ¿‚äÏ‡?4eğ‡'O¿\z9üõò€®DÆŞXææ[À]¹)|=İú\%n`¹ğWİÒšiõ·›Ù«”™×gÙ8–@O£_+áLÛØ ıãŞlÖÃeğgÑíHY&hĞÎb!¦Mö°<5>ñì`3S…øh`µU+j°jgµ‰ˆiº^;/sõ´c·*YFJ]m³Eùæ˜É%ÔÇvèHpì¹i '¬ï¿úé™J%~“cÅJQí´º˜ÖjqœÒÎólO‚Ù!œĞµ>ÂfKHğ5Ò%¬HvFçôFóå•:ú<&Ë‹iY“¡ÜòE+ÃrÓàœ+»TqÃ½8ØèKN.¸Iô=JŞ=iuÜ«Ü¡†~u8ĞÏàCŠkQjV'ıÚ…"A‚²ÛµÅá&G›ŒW±®±9â\ÄHDÁpœB†wòĞe€Ò¤êÛT¦›Ç¼0¼xä&@U®%Ü©tm6¼Ğ½÷×@²‹qŸ‘[Ç{PÎ‡ÃBkıbNÀì;’˜}#Ûw¹EƒY x‹^ÛQ×ğ>Ei&:%%6Ë¾²„ÎLáæF®qŞ}hó Tˆ¾dQää|Â½„:)nA¥S¢ š…K)mLr®œ=©š¹ÒtPÖ[=…:‹üóìÄEQKJ+'B¤[sÌ¡|>Aï:‡k chïVn¦Ô³
+¥ÖÔüa‡ó “3ú›ËåŒp-£ñH¢¾äíHg«×ÖÙ×<œäoqéÀ*8ŠÒ.¤÷jy¨.î:x™É;€q¿zğ’ˆØx""äŞL˜Ô¦½AUj9ë)AÓ”•¥Q¯@¶°™XDr;£«§(s·ÉaÄN2¸ó¦¾ÅùÁ[ìA'Ì¤!’ök$96á¬&íˆéÜ—ª±ŸÔïùHDÏõP\Â[»Î¼Š »ƒÍlªDñ•Ö5”í.×ÄÙ"Ø]òÁ®ÿÛ–©ÏND#Z‚¬ûT*:¦‰÷şIÄÛŒ_u“3ŸM×7ÂqB:hkp	s$ÂPÜÕNI÷Âå* ~K<'NÄ×ögó¼‘w4ÿ•–YUªQWC¦Bÿ0÷t¹VOBZyrUY™ÀeO¼YÄ§/[ŒßAÛ×7¯zt‘Œ÷¼™¼­9ú.B1Á².P;$N²QÛgó‘‡(A67Ìô¸iÂÿ”3O3{ÑÉ|ŞL†¦b4X‡Í@r“Å–"½CĞú
+7°-‚‹~õ<DıöfØáº ¶îàQœÆ8sŠ»z#ºÁ3gëŸØpp	ÖnÌËÊ(Õ¾ï8©*SX]¢Ò±¡êA_¦¬ĞzK)ğ¼iòö¼i˜åunĞùÚ«p³–5ÀÏÑÙŠšøâ“›éZø2´Pe<Ï³/ÄiÀÉì~
+q6ÜğÆ‹èv €AÎïßpÿL°ny{s,Y%„ï®×HKˆz=ä…r8øqrr	”¯¤ŸYPMd÷P^
+¶Jö8Ç‚BÛY+1T*éBåÑ/ˆõŒa¢ëÈ™Xå`TÏÒµX:÷~OIG¢ö@·¥¤•Ğñf	GZ/.R¢G6©&£ÚšöºTËQ"ˆ¯L£ÓUÜš˜ÂJrA%W@’<IÉã9X›^ß<~µ¼Pr¹a%ï 4Â,eô1Zõ3Åµ“ˆc|À¿²„ĞH/¯ÑBN-ŸvNÎôğ²ÛÆZ:`0é©pÆÄó[ñuÎÁLİ‡RáÄeQ/®sDa§ƒ².Ó3Ğ–B¢üY_1p;o÷÷¶æı±ó}¦¡8	:¬~Ú€IíVGJÂˆé-ˆŸFÄ­ò»£×*¡E›`÷T~2 ÛO§×4oØpÙ´‹¼®Eÿ¨Š7şû>{R¥»’p(õ¡œÙĞäù“—ë“6³|I¦V{AŞ_÷¹å)^‰'Êå–oŞÅ“äíÚÖgšk†=<Á®Âb¢…³¸ªr€Z ìUã“/‹yOS¤íÜSta\
+•îG.ŒŞï‚Êfñ¼İ8W'ƒÂ>œ#ÌPÌ*â¢±eo§2”2{(q¨D[«@8Jª!‰Ô+¢7şÃ£¥Ó}ÅŠØT‚üµXÊÀ²ÕİÛZpse&¹e·Oë„ÀùA×Xy^|uàÇÏ³/Û™nVR`[èÁö\unâ¼NÆD×›–g¥Ä´cf]nÜØCÄ”ƒÓÅ“ÛªÓS¡ãş¹„0”—d-Ş¬’şŸ–{*VJ	,L?‘óÆ`†&TÇ.Á®Á—M[©PRÿ6F’aŠ—ñrm¨.­•ˆÔÕhb\O°÷sYÆTJª6cÈ›©Ô/ÒgdR–YÃß£­#*³ÊrhĞ´7ğ<{FæÜBÒ,G°Hl"³ˆawcÃwœãÒhÚ9r„F›™ª6]Ïfl:Îg –^W7²‘,äôÕ¡ÉÊ´ù©¡jùDFX¨EŞ6ŒpvŒQµ¸µZ!/4ĞÙÓÄ´*S‘
+A‘¹î“¬y`Å‹Ù¸Ì	ê®\q)¢0îA¶æ‰~ÆÒ¼˜W¸Pj†»N.¢ô â•© ¡Œ¦Dr}°¹H}7]X%B³ü§Å ¸‡'€	/kêßáu°w¸…ØºîNgëûîignÓ€’bˆ«D–”KzğŒ§´û'£İÈNÙ	'_è?t¹Ñşâê°ºúl&xÅ¡”A­Ç6Á´Ò
+m9q
+j”[PxGvgro¢ŸÁ†‘È¥h“£fôÆ©}ÜRˆP¨ø
+†….">%¹R@F0“ö¥mµ%Ü@3ÄÂK!ƒ%}¶¶u¢h3`ÿÄù.â9õ.-—A5ÑJGJa)
+®1h3_&I|°g©õš[³ ¸`ÀJî¾9ÙÇ™.Áè¦~ ¶cÓ}ÂPBE, Î]‡ıåš-Ñ7\N±ôÁ À¼i³&³öY^×îgÌFÑÆÙÅˆİUµX8\rèñ¸ØöõÙÙ±rfâä®«ˆ³l_}üÈ  ¯?~à“N+%çÇ¢s¾,=)J&üKEèY>EVš°0OÖKÙŞŒÍ!´™nme?­Û	XÜÃVªAğa §	'¼.@µJæóÒ†ÅN–ôïMXn3õ”¥¿‘Ş¾hŸ)µä 2/†IèRh¡ÏûÈËŠY‚ÃÀS pË¶³Ä=[‚Gé<²¼*[¹ì=bÏ‘)q(y‚+º ï†ø—ùÄƒt@¢cü$ÙD4Q7iÉ{h^N^‚ÎÃO,D¤/âã2Üm
+&çå±ªŒ ºñ"ˆ2z.édº ;ÊE«9VÕDËÙ…c]]·úC=&¿¤÷Ğ7ål_n€çëğ¼à.DéFƒğG‡r´Šlà#*n>à£“â<™[$$”Åx ‚˜X`"m`ì)ÚÔª|¬!ŒDâw.†‘‡ÙhÜÔèœ‚¨ˆy÷\¤¯7Y˜EoqpÏjÓ{«‚¤Ê7Îe#d9ÇîŒ"ğØ\¢²†ÜaP8¾¸D¢ ÷Î(Ö6Ü àUïÛˆ0ıëØrèÍ©Û4wK}‰"(ºó‰—W¦ôƒÓ{wöNÏö·Ï²i=9Ôá»ùx¥EŠLê^SìMıÓıÎîYö?öK€d×—”¥Ğ(¦ôúÒw!‡¢^ÜÛJ§ª†G­ìJ şá›ııJåwq|‡:ÿ*€ÉÊ8¥–aÛÈÃØ–Õ÷ÉØ~ïQĞË°íúÿTl‡Fk°õò0¶£VÊÛ(¿{¶u™ª# áL¬]ÆšHm%ÓÀêl›ò
+½·ô`Dî[ø,ZÑyQ’ô2`ÚJ[8“Ë]mM0Í¬>0m¾…rìg¦ä¢øû É¡º­ô“6ğKe­ÔAâ‹øU‰7å-Üá!V¹Ù½n¥‚­G´tÈ ÛÃ	İ‚2wv"›¦=Âƒ70:)¹F—MgEnÒ=
+qrãşfİ8¢F±=!G6)?ÎªÜ¤]Ç»ŞUCƒ"$Dx0È³QÓ#6
+·é°#Ç—œ0‘I<j¥’"s•Í/©—uã§ö[F$ñ‘ê±Y(ì,î“Ì ~IÈ¬ÄşÀ0$‰dóÿDˆAf@r¨$Ş^<Ìå{×ö4ŸrMû·Ï!o~==‘Ù0#‘dWf}J¥(µ~øYÛÈólÍ¸³µ%¢nü™<ÛÃâæí»YK+éye0Ğß4ÎöQ^àLÖˆ}zû8-£±P*k=-^©¶:F²v´Ù!.~Ö¶áğ©›gm‰Ÿ ŸÂà»†OıõÙø| TòïŒO•ÄÍğK€Ê1>Ëœ?.ë˜¥e/ ÙCVM	ëM°)ÁGF ÷©¯ÖrUi·7®¿ ¼oû“Ôà.´`\"ö Ú•ï™{[dkn‡ôe#6 x`7ì«‰àğqÿš)ôª@».Ë*ÁXŞ«è¨ !v	‰¦o©õã·qËzŠ7½¤g ®h±2yºDdW{!)vÖ’”;ŞC‡Ó°H,è5ì¸} eÑb|9§İc…åŸ=ÓtŸÎö%NŒ'æîËˆjé`iƒYÛFov-ßÛ°ˆ/hK?–7-n}ÈÌÅ†}B‘„á pòW9ÅTÛ¦PØEëÒh«±¶†9½\ƒ_–ì>›v¶=ÿ8Ecˆ‡™µÿ×z{tÛ¾_5pyßäÃ)€êÁJ ÛNiŠeÖ£"ŒnÜuebP@x­ö¸‘ùæW†æb<–VŸ`¬5:µO…èTk‰`p‡BÉpR"M[<:H8]†ê¾æ%:ÃPËµ¦iÒ$ÃÛ À°0
+|E¦™6™.èÄÎXB†¤¤¸Ó£5ºdŞÜ9ì5‰½_cúK´ÆÀˆM…ÙDJÌÇğó¤ƒg‚
+uqRJ•ĞtU')«ö^
+ŒÓÈô›¶Â!·³“½†~µ¿wØ‘–Óä²—.>i¾sµ["'^1zÄÔ†.D¿œ´‘“ı¯Yñn0®yÎ\y7O›ólƒ¬rië„V{¤|pí¦àA6äÏ¶Ì[Ëc&¸›Ñ°ÅßlWÒ¨ÅÓ}¤±“_,®mîLL‚è(TZ6½À‘¬-:#åºŸ0WYâ[5~cI‚.9#è˜3d5kƒIh.+AÙm‹…$É`Iéf´33ÔqEŠìTÈÁÇİÁ|–ó®~™X±“öL
+»vûÚ0»=eú6¡S.f—ş“(Ä¦sjÙ>‘©@ñÑŞw—#f_#Úñ]’}€K¹¤ÓÎY$OË0Ã3ªBlHê˜“#>ˆº)í3êïğÖ*qÁX¤ƒhšËÖÇWYG3Ô²5cìº•‚ÕB¬lLÑ~fË@Ğù¾¢³ÈÇ¯Îº;{'Às­š?	 ş ¡CCØ$$7«o dšpD—±'Û¬Ü"bÃW}(ëªRä}M
+áö	³*)¡/Ï:è;,Á*(jÂ.-è‹š¯íHàÛ“Åš*O’‹5Wó
+ÖM &°øè(!å	è«>>¢`üè	ô–`%J9õDé›@íááŒ:?ÁÎ'ÈâØõùJ}v`Fm—ébÉ¶c	®øœÀÎdø7lgÎSÛ]5_ªôì7“¶eIjMO\Ï:;¦ÍG*xª„1JRá<†1GSîèİ©Ûu³»OO6Ùa"6ËpÍE´Ù°CqZib>b{³¶3)m³E2¼J£B`šo68Ø†d¼š^ô¢ËEØ—ŸO(˜‰ğPå&
+cÒyßÙ†XWª¡rvV‡gc¡®ŸVá¡n/ÄïŞzY~ u­¦PÇ³×pÆG'†O{#5`=$É5ËWÆõ¹?È¿ã.kdt°Dâ±aÔyÜÇ]™¡‰ºÃQĞh±e‘íòÏm2[?vOp¸ÓtLR¨L§ddğÓ½¬ó§ò3ë\øôòÎãù	üÇUæò‰ğ¥c³‘îÕI;ş\{\9j³šJRLóËÁBÃô8&¤u2«½[„¡-Æˆˆœå×½Yr'Ÿ—2©éàqb¯/Kúåk#q6È¶†½ëGn)Ò©oî@4•/·)¥'7é$Xúë2^v*6  VmHÉ.îçg Ä®Àìv³MøI»]ºİ†.aµ4àü36Xîÿ.ÚëÈÇİ]àJÑŞJ.5hˆŞA>s?‘Î}ÃóLN¸ ’½	Á`ñ‘—Va~}h1ír8h±Å™ À±7%´÷!Iû(
+ëƒ/OÒ2åJÊ&„Ñbài (óš_1j©ÕxñıÚ‹ÑÚ‹¾ãDè¶…&y¥öÙdz1ù¸¾3¹ÓI±èŠuWuFHx†I©-ñP>dãîä]taßqµFİˆ€çë 7÷¾Ë  Ç=ö5º’ÁayoÔÕ3‘ïD½<•¯a´k˜ ¦Ç–­¢CZúŞrå´ZtWÂãMØë²áIó’ŠCÍ•ÉDš¸ìrãEï:_)šæ\Uy¸0€7
+n\áA`Ë`†—ğ ö
+Xa@u
+èã€³‘|F«™Á™b'QX£R1XIp‰)ÒËÂ\»É|ëî¢ÒÑŞt¹˜t‘Ä*t?Å¬.haÍZi›ÖÓv}äûha¿ìœœÀàêc°X"qn¾ïr]Ò$¡A°È¾¶ÙPsÁºèÕr–«à8ÛGXÈO¬µ¤	Ãf*:•R»ÁK€a`bî«X¥môA»a6ãÌ:2Õ•ï"hW˜×¦iOìÍAq‡Kše2æ=,Âøè”Q¬E‹—$D¸(½~
+FØÂÏŠà#p¨PHamÖ<0úêî€¨ÖæØê‚›Lq‘ÄaºØBjö‘%D"¥y¼·±Ç$tEc#;o´˜ÒîÌÏ\¿LÇúy=¸’£©|âZ}€/òàC~¡onòÁ¥<™õ>ÈçåìùçZr2ÓÏÂ=ïÍ´\ßu5û å§(/'”êÆRGÓ¯¤µÑä½|öŞô÷;ı}5ÔÏ#÷™_Œ´€iäÆøåµ<úJKæ<Ìßh¾p_ÜÇûÉ…<ïŞ”/!Œ9È¶ıÁÄ ûRŞöz:ü=È= Û’F=ù}¥Ÿ=Ceîd×®ßÓ´íi_QÖŸhÛøt æÃBL§siŸú „!fs`óVR-Ñê6R·tøY¸{ö¿CÆÄı	 Ÿ(`"84VñfgÀTô“Ù­EñQÂCÛbqÜÃeÙQ){Á‰ ï… Oi>Çk˜ã&CÈAô1èkvmo)¥Ùó´Áví3º*¼:~'¿İËç`ì»{'cŞe²3Ñ³D¸ Úß\ßÌrlÅ|]í ÅŞ¼Ä7ÄÄ/N!.ûW¼øŞ^nf—Ãüèj6aìÀø96yØ\!ĞÉ;P·†dÇbv;´µuz³ÀáøúÊû|_èï.úÃk {e”vS´½Û;=b=\zoOv"~Ãgrë=OÂŞ×Sn„™ë¸
+Õ}7‰V¥UŞê=<Ndu)Mº_¨ÜŸaºÓúİ‹[ŸÙ¹%W¬‘~‡<EîÉÌÍm†,œL+Vnlóc‰7lPQ…EB·7TŒ2c=ByìxeÁ"œD‚ï¤ÙûJBfÉ"UõJ ÛñŸ,‚Ùj^9#ÁÇ>`#±ÍĞÅo:Ãx®x	#Èß`õ,óˆÛ@µ:2`ã?Ø5'#” mÙ^ÕápVeèÅ°ó^°(±å¶ŸÛz Ö(zî³ÓÎ™è.½µd­ÑH	ïAJ–:”wä_ÙéŸöbAÙ½£ ˜â˜Êfë.×=±ÛˆïÍ«˜ˆT	‘4ÙdÄ’pauoQ8«›¼@«@÷i
+I6ÌÌf
+¯œ ¢Az6YÔ÷P©VL2Ëû7¥fñ‹Üd­ÅºIU×HWM!ub£j¯Æ†ƒS^é¼V€û ¥Qµe"¿âb†Yğ°B{Ïé_İvaVØ¶ˆĞÕ´˜>õ\€5ÀØ8®á/\Q¼ë:G±
+i”4H¡4.^í†ö5×a0Ñé‘·­K}TÓ%¥^,PFÕ šøtJvG‡6\
+5£“|åTï(şwQ÷åÛó"!›]‚—næà˜–;l¢¦K0±™ØÖşbvix`+ÙºÔTûëãßÉìX™J!¸ë®Q®±sò}÷äÍ!v$bĞƒ¸¢‰¾RÏpçRÇ±û3GcÀŞìò>[ûwû)æ¢Xöé¦Éu¦ÛŞó“ûì`Ø¾œLo¿h¡EiQ: lÅ…-Ç[ß"‹'LÈêÇŸ \¥~öøM\Ä¾—ğp"‹ñ*JHÜO°ê‰‹ÅX}~>Âqâ¢öİº56ÔD<@û7æc-Ø§˜[Óµ^9ëÒÍ¸'—?Kè–ëÖ†Z'&—x\I–y=Î	:ÊÃûgÆç@Ê±`¿i±«šñÎliïÄ^'²Ro|’ÉÏ^9,mbY4›˜}àÍ”R„RÒ´e¯BÈ0q6_®¼„İÙŸ`~3ÁÁ+ëÄ?'ÒOƒÒdÈ˜åZOĞVT'ƒiÉZ§´(\ŒÑ‰4Ì»>ë«°«5]nÑÚDüÒ¡AÁóÔ® ,ÚÃ~ñvšñ8æÚõ©%IWv¦nw«JË{œFÁ¢	ÜMopav¶Á±Ê¨E‹¿7äï1+-WZNƒšÌºŠ¤»hÉ{jË:eÍ•İz³³'·)Ô–U%Öİ9Ú~s€³®¼{¡¶tPM]gÎ1Î³ô³f¹I¹šO&C™XX%Š$êåt»pñL£Ô »öş%W’JšrJ+zÙúd!!CØÓäâSğf†Ky {ä“j'ŒÔËØÑ­“'¬RÎô¦TœÅELÈ>p>Ú}•ğšÈ²Le¨ñ¶´¢¥]™-˜7Ó7+¥÷a&ƒ«3 Ì·…Y³1Wv²¾½’&áÌ®· ?ø¾byĞ£û!û£Æi£³µ#
+˜.ª ëRc4³Airq¬ª•$9'`¸íÖ*_BüŸV†¾G…'l‘‹=ÚËkv0b‡Z<NäîÜ­.ú&jä=ç' ªáb„°;½Ãã7Hêİb«C—Wôê¶kÅ}¢lœçEgËQ`BmÖâŠM~[úZ*)ä¹D“²‘ÎáãúÜTœıäL„/ßÕÓ06 ƒYZÒ<TDŞ&#÷2º£ï¶Åyjƒ%‰®*J¬N^ÎmÊøyµv[w8>®Ä0Å‹f&åÑî6]kÖlıÇ¿ıÿs¥õ›ç[kÿùv…Iôºø­¯˜#U±Fl`|I3\JŠu6äŸ‚H”0C–¡ Ússel=j;ˆP:}VD~·±GŸ®‘‡ÈSH’ª¬Ÿip4™Âp<(¹:`	¹bè^{Œ—ÅĞÅjK&w‡ ¸ÇC¨ÂBùøIÂr°¹ÛÚDME!\Ú|¼ÃÜ_‰âG%û.ô`¶DÃN‘a‹Ûá£´,¡t»Äb`_ª{»a•
+~'…´u/z¿QÛU­—èÜÊOF• UÕi[mšÔlœå‡U~½üKô|VLA}#ÑëúràËM¼D«£—ˆ.aôU‰Û!*Áğ/²uõ½ĞqŠ‘ÁöÆ•ƒ=ªİ³tªÂiM%tq¦ã ëÖ@ÄnJ¤`qH †…c¶Í¦	Ç5“IK‚ÛØ_	Ç+ç¯Şz^B¼ØŒÕ°NÂ€Â2¶R·\©Ş!]ô¼—ÅSR²ÊcDÈ³$cA<¼p×ç}Œ—
+ésOµ(]aŠ~m†ù1iáD û:? ßÍ*š€d@ğ³d.‘³€¹_à¨¤ıÔ¹GošA³fl¯²,¥)àßµ‚ogˆ¬×òÑğüüj*
+97Íp"C‘‡x‡§Ü¯ÂƒôÓQœŠPJ&BëÚ‹úS.îğïxÆyÌŞfgHÂ*0	Qkébá1Bî"Sl¿›€'2¸o""MùşR$‡º’p	ï_éC§~È;<u—hhÛ¢O¥Òú ÿ1’{…HqùJÎdNñW³WÑrò¶‘«Fiœçwhğ~=áÛ°;§82ÛˆeÚ‡Nä(T„ğ{±·Ø\‹M;³§€Eyä´Øo<àÁ]8(a¯õÜNlš°Lqa%'R­i $k/]ÔW8øËÖ»}²ŒzMµuc°­8ƒ oúñ¹®Ğ{ÔfÚßç1ŒL¤ÕJ‚b6^Œ6^ô³¯7^l¼8¸>›ãŸ›/’Â~.iÀ¬9oƒIó}7ƒ®ù6f¬Ú`©É†éT•6İAf€Ã1ié7Ù"¶ã	/óÁ{Ï…nü"$”Ôt¢d‚ä½0ó{ª‘Ÿ‰š4?‡uŠHe^­í´GB/]“M»À#@uŞ×±'‚ğ¦$/Ôo1ß¨ëÆæ7j¬ÚPººKv0·×x Usòh*“Š1Áß‚µ…h7%]Å_ÿ˜1räx’;â)bm“wÕ&¹’ã&Ò*BÂ+¶0éÎÖƒ1–½„^õŒ˜­®s|Rz]ÛËøùÄşb;˜÷æäPSÍ'¡B!§"mc1ÒäDQÜtEîí¨ÆÂĞôp'uæSÑ§`Ô`/†>Å$UáíIë©ÄMLÙò†mı|êĞ.Œ*ü.‹ˆtd¨ûôùû;Ï[2_2®”—”¤ŒÓ,p³Û9^‚X¥ÍDŞ°lé|nÃ6ëúØ¼s_ğÈ1™Í;÷…¥LÎB9û*ÛåejT/Ñ‘¼s ÎDh†¸Ü…¢«va[¾òùt	Ùó8_öÆéqÎ7åD,-|âNõÉC¢S,JT#w°X6U¡4D6»½»[—İPİŸêñBg<3Ğ<n 1vr¶'ë†2Ûkpça(tŸ`<S¹)ÿBwj†û\ŞL˜¼Íğü”³ıù‡µßŒ%N=;à>¨ûÆI,êÀ¨ÍFäW>aÈUÍÉa‡D9^©(å>§"ÄÓÏèø^ƒñú3jº¹øŒš2©Õƒû‹–O‡ZùHÎîê2@	,Ç(,½¡Sîüin~¤3e›jú§1SéB5ij‰+h?ëŠR $q†İÒ-K@S{hX:H,DÑ
+h¦ãDqñ©}Ï3Ò¥ˆŠ:`^Œ› 4sèJ‰X–­e|¦±/_]ğ±¬g Á<XëŞu”<}=åİúWgƒwg“w¹h —>ƒ³ê0ŒYÄ³ø¹Ãœ0àh^Êœo3Å~*£U®«ø)HwQdŒ6Eº+¿äFÁfp>Ğê¯‡˜$ƒ“¹UZà½»ğú5Ç3ÔÖ$(œîWH»s9+‡•ñ™Çk¼·¾‹»Ïón×b•ªñ±¦UAa.+hÎíŠ¿Ş\Ôæè67¸ı6W¶Ãéüeo÷ìèh¿»»×Ùß¡õ\~cÆ3¬É£Ù ‡IzÜb“~!¬upuËr>*òFPíYC6·šGÕºˆ}¹|—–”GqÉL£'ÏàÆâ.‘ Õƒs¿ˆµ_e¤Î2å¸ªğÚÖU#ÄåaRÅÏtO×(ó LÆ©ÍI7ÛÜÄo³ßÂ¼ØXƒ)[©TO õêQ	éZ˜ö)Êçµnåí£ƒƒ­Ã@QëN–)ãó\æg¸h“íágñ0—Ğy{Œõ°@NÎ4.¦­•ó¯_¾LŒ?Ğº1<Éc=æ9¤!Â°iş¼{‡ĞIÌÓjˆKªáıvÙ{™‚wû8q_æéTœo¥Q†N¬‚4ÒÒ>Œ+šˆ6ãzÄVôĞÔ§Ìµ1!™¥#ñÛ2ULEı#Æ¡EeR
+l
+Ó®X[m=ğ P\¤Ü„[(›ÖgYÊ'ój|UÂÖîbŸÒmGßt+¹Íïú‰3…MØŸ‘ğ¹à€fÉ~È4a…ª6%{S‚ä$ÿZÈC`¨e›R}ë¥–wÅãÇ$öGuŸF´åÏ¸Jvix«ëï vM/ƒ Âüä¢,MÊüŠÚÔ¹J8 æ†Rä8qª± y!OhµZ—ø#ã~õ/¿—Oêw•È¬O\;0øÎš†$¨7ö¦Ë›Ö¬ñ×şİW÷ç]{‹o_Dß2ù½ı‹> @| XšMéö,æ'ßÔ—ík\»8m!Ó_üÁşù"´Ám„IV„ÌY y×$jÙ)Ğ²Á[å‰ HñoÙ’ê-Ë-›º‹>ÑéÍÕæ¸yèR[ÔÃÓnÚêñ×ñsQ¢VµÈ{ÖeÃaY“ñ"p#±Wª”ZŒÃ\„îÛp²ÉMG”x%×ëÉşÄ£ÈÇÖQµ4[B.+üøâŞ>Î» ÿHŸ¹_Í°ŞtèUrIÈŸ 7(ÂA$ı;Êyµr¿–<ø¢üàKx¿“_­Üo$¾.?øö ?ìÙã#:‚ìé.Ó¥¤ÇÚü+ÍÁ1ÅÁ˜ËòîaCæÖ:4”k#~ñÚkä#s»Õ¹–ã©5KXÅ³gÿÎÉı
+--- Content of ./.git/objects/3f/f868f40d574afebd01717eb1002ec97dc2ce9b ---
+x…‘ÍjÃ0„{­ŸÂøÜk äVl†¤zŠ´ŠEe+èç†¼{weÉäÖ€ÉÎ~«Ù±|6ö\ïŞw/÷ª®›o-Áúf_ß«×¦×>ù(…5[H¼!é´¬»mÈXÁƒ¶âMë€èğ¡‰ÿ,ğØø0óŒú7aŞšø|œVêi*ÛÑƒ&qœÍ$²Ì3K:Ã.º5…)uf½C³¯œT‘`8¼ù¦+ùgæ /S8B G)6'™w`ñC— VLË’šÀx±!O"ŸjµNªµ‹Šn—^=5™ULlí<ÿa‚Q¦â¥ÎlœbÀ|¸$ÙøU3Ü‡bp¢[JÙ0èœö¶L÷†û‰z*øáÕ£ªş öL®©
+--- Content of ./.git/objects/df/6d9fc905c96f653f7eda20a05971c6674ab130 ---
+x­Z{lÇ™ß%wÉ%¹|I”DÙ’²zÙ’bI~Ôv,;Jô¶bI±%?"ELqWe>”]2¶xËT(ÚB)T1Š³’Ú:pµ	îÔC‹smÏÉåá^ïp»ÂÌ.Î€ÑC€Ë*Òâÿußìò-9ç¶7~3;;ûÍ7ßÌÎü¾ov:™föí}jïì}»İŠAxã%~n®Ãş]d‚!ù*
+™«‹±x›ĞS|‡kCĞ2LpTfCÄ©å‰ )d0ky<HMPŒ3¿\>ÈğÆ&,,ùmlÂÊZYÓ·ñ	kc)HiH-ÚY|k¦¿DõGšq•b}Q.q·
+¾nêåÇ/ÂUy0âc§B\ÔU|S!ßÂB <+ø‰lSf†¼ş_ı
+G=±`L4Îg+°ø{Pşüõ rDÃ¡O×	BÄ’Ù;™(e‰ÉÂçb	R$“½åWÆDBÄgğ÷àŞÙû8µ‘\[B¡®&Ñ$8,HËğ+æÁbcèxÍgûÜ‹q0Gm¹F¢ö\^4‹¦B…}ò¶ou«ÇöaqÉpÙ8]ÂqlÃá‡¤©Ç¢\_›€ §2¥¬YÄA¿”Hı»N¶ˆ8±X‚z•Òz¦å.á—0½fËHüà†˜ñGÂQîr´5äûf9–ñÇx!Â3Ñ3ÃEısw9 DQEóGx6îëêë9Í´0ı£Ï3ñ2æÜñ¾Ñ>f&ä¦Â¾Ç<Í4
+§Ñl›ÍÌp<ÇúóGi·ş_Õ ¹ŠÍb"vŞšÀEx*3ÃŞ0¼nƒ™‹óh”„5TCÛ^•`9Á/ "†y8Ö>	qíü%¿/´0Íƒí½|da:r¹ı$™å}!¡ıäbt.nqlÀ§Ó©?ëâß‹‚BºTË·-,>´Boı‘ĞBg¼u–‹Nez¯0™ÒuĞv,ñû‚B'd2ÕË@*¡
+È&íìÑã±Ú›t_È|÷±øÎ~èŠÍ©XçÊÌ€Ú:˜f‹J²ÜtlV5éƒ¡š¹Ëœ?åTJ“H˜SmH|`!ˆ„A1T5Æª¥ï²ŸÓKIç#<p3³ÓS0ÌaÕ’$Õªw(º¸À©¦`dv–ãUR[x7©ùÈ%•öG‚±PXVAÅ9Á·˜LàiT±ò‘jâká>ª#¼`	Û4Ğ¤'Ey–M¯ÓRÙL+Ô°D§\İÉ’«[ËdÊîùşKß{)yzù%ÙŞ¢Ø[61“eïÚLŠ.ùşÈ÷FV&$÷Èt»B·Kt{ªÄ{µıJ»\R¯”Ô/÷¤JË71Ü^•ªØ¹iÇ´g5ò{ÄåˆäÊôœ«êÅaÖMÊŞnHå=ÊÎå¡{¥×«Ckõ²·Mñ¶É¥íJiû¦}+‡G³.lîÁƒÅmUø££Ë61éÉ‘¬ÊzÖHe=oãz*S½
+Õ+Q½)gér4óƒVl’ÀR¡ôÿ­=İû°¿mïn0~TmƒìG-­ÿ¸‚†üÇDw“ùã&#Ê?‰£ü-¿ÏÚSeüøhyO…ñŸ+HÈû³ë"°Dû¶Á®p`	Ö&Cşn b°*ŠW¥¢Z´‚m­%âÉü5ÓCázÜ‹­Îÿj„	«;öˆ=£hI˜E3k|ãñ×™"i‘„õ”M@M¢$3ËoÁDs‚M¬ù¢¶ñÁ(ÚÓA¤¢ÙÕ+ÚcxÃŠ!Ü–¿ƒˆT!÷¤)Ã'?-ìs2¯µ\-–b-¬õ=‘²;aÂE¯k:ävÑ{‘í;†ÜjËÒ…{W‚ZÁÃ¿…>ÚÓ}<úµRçµ’iúÙNyœ±ëã¬K“`$p§%øï(Z`Óa>»³%_'YQ¯¬¢•?Íu‹îÈpÄ0ÑšÌÛmså…ı(ä8	ºNØtÂ.ÚØÒ8	\hÖƒÒ80íˆj=9ğéËşDéü¿JŞ${ZæŒ¼áÿ,Ö™Ñ[şøÒòÎ(ZüÓ¡x'¨ğal+Òc{óíy¿®½Ç™QQOF›G»šŠŞ4+ü7úÚJãH8Y'[Éî`w²U×ˆG¬9ÎdI¦½ü´p6±ÎÂù”pEwæjhĞQ¸Rˆ.4Ë
+Ë@«û 3îÊq ÌØp­qÕÚêVƒV7ö	Ñ½İ§!G÷«îÃë?	¹r)Àà¦cĞÜ½-É<çZf™G­Ælm¡ÔL´%÷Ü|y&Ÿ;jk8[WÈ¡P‡`<J¦úGÊÔPÈñ‘2y·JïùcÈT4"±í®G æİ5¯õ]b2¶Âİ\àí`âÎa°Ë 9Î¸ + R$Tl$^ºB‡™L&niïŠÓc v£8À÷&3c~÷İ+LÜÍ\
+DçšyÅŒqŒjE¦áTÔw‘?Ä;â­_¢ííK„ÔãîÆñÖÆPk#Ë4ïhîhSÉ™ O˜ëD@Å÷© ¡ÆENP‰(ã¾D{·İÁâŒñ>„Qãî¦IöÉæ<pÁŠû%šJq[^qÜşÔlšlCõŸiP	ğzÜÛôâ$;ÙvşÉæI¡¥i¸[èOt‹İÍ„`˜ìYP	Ş­NÀşİqWn/øxcâff†„˜İ»;m*Õ|¬¾]Ú5 ŒP¾†¯-½…h„_Œ×¥U
+£!ßL”ãÄ\Sts%ïBLÈ@”	ª ²jÀ=!êû9íĞªQˆà˜İÌsAŸà=\vq*Œ\Dnàœ÷Ï©F0ÊUc UM³|$¶ ¨dÈ‹ˆšy~´¯§k¬O%c0Ox½C`èsQ–›ñÅ‚Q'¢_tŒ3ŸÀ!s¬ƒ 2Í%*3"ëPÍi/ Ìš´í =Kúƒœ/¬R`ÍL]äa”§§´9©ZmN©¤X´d
+zÆ >øœŠ‡Tô…T"T5Íøvy*háÌ˜¹T76Ü‚>¡¹¬”üTG«¦ğ9èu	KÑ¥¾áZêÿöä>²vD™èPˆ‰èÈŞÚ“<,¹÷@”‰V…h•ˆÖû5o‡Ş
+½¹ÙÄö’Ìï‘©ËÔJSÊÃÜõ4lx’/È6ÅÓ¶lIÙ<’÷YÉ†bŠöÜÏ6ãÉãRÙ8Äõ§ôôN@OejB¡&$jbÓĞd)Kyª—ûî;+Vm8wKÎİ÷J«W¹w_KÛ”Ò¶MŒpá¿õx¿`ê“}7¬7­w™½Ì^™Ù¯0ûï2LÇ­··OÉÌ€Â¬Ş«jPªZ×·Œ·Jn?K§äªQ¥jt¥ï¾ûîÊÕsîÉİp¯šI–½9qmânuëFu«\İ®T·ß­>¸Q}P®>¬T–‘ªQ\ÅWqéÅÉò=?±áŞ-¹wßóî¸f‘êıÒx«ïçÖ_XeoâíY!S¥ŞMÌân½WSûn}2ö¾øxãÕ›¯Ê5‡”šCo¬t­¼¼Z›ªªNoO¾¼¶ÿÆ+rUë:.WíC~QUsm0ş™ÿVãOæ:/Wu)U]+}©Š*ĞDYë½'êŞ=°FşıcúGò‡•'¿I€„ûRLm²û†iÍ}ÃºJ®’÷*w^óJuûÖs‹üÉs?}N®|F©|,B`Â4&¹ôMz•|€:tvÃ]/¹ëQ‡(©öØ/ı·>ÿ‹ù»##rçI¥óäŒVF§dïÅ{!İEÊ}0Å4¾O¿CßpÜt¼1¸Ò³ê¹_]“ª©KÕ4BÜ´5`ù+V±ãŠµáí–·ZŞÜsmÏ.—·(å-›6¬lçi¬šy—LúÑà®•™rÕ7”ªo¬ô=xğ…ti° ;0MR´w¹ÿõ!©rdí8ˆ·ÆõôÎ>=•éçúy‰~¦âòqô{íxÚ´”!ƒÂv2ËäòÜkÎ×œ›&Œ´Ş%<„gåÅä»uû7êö¯wÈuJ]§Tçÿ´î“İw»G7ºG¥±IilZº0-wû•n¿L°
+ÁJ›",éç§’Á»»mì:´şWò®eW´köSş“KŸóãoJç.Hçf$vF˜UfebN!æ$bî~æı|z“ÜOC”‰N…è”ˆÎ”Íµ4$ şÑáAû	ÒğÒzâ ùgå‰6ò7m$äûı&¸	Èú@+êWûÀUyY3a{R4Š,³„)ŠöÆtqÑ$EòCü=àøüõ0Ã.nœGmi!ãİÔìÄ-Ş7ÑÌ—‰æí%`‹j^s¶%°@‘ßÔ„¬Ñ­~=äÏÓêge? æg}Üö¶ãZèÍÜŞÊ,D¯…˜)AqÈ³ƒ3+¶
+‹8XX*¹­-ÉZfñ|A´>¹¸¦ğ‡oÏ³Ø&}Ó¢¨ıº9a+i‡hÛ¯ÕrŠ–íj‰ÿdÑx¹4ÙÜÉx¡Y ¾,™µ…sZ.Ö3xÔi‘N"WÜ– ÚòmbÍnÁÖØãXÉxñü,Ñú[ú—õ÷Q^û¯õ #'s:€5t8a×FÁ3-°M²Ç~Sa~”‹vå-~!Íf²¿jO{Û!—³™š+F~„ó£Ğb¼,u¯y}yddk@4¶rcÚñ‘ã£Ìï–~À„‚æ®ç¹—c FóĞ'rÇmÌX$Æû9Í¦BÙI •>9îÓ\t÷ò&nhâôàÈXßèifpäôóPÂ4Å­ÍÌÙ®¡3}cLÓC¼L‡SCpUê`Rg‘™ G|GïèøÔè™‘æ\$d3ÌÃÜ%&N§Ï´>Åíƒšô ªvÓ’¾	<Jô;ÌŒî×: ˜8³›?
+hv«Ôp×É“ƒ#cüQ¤„òtTm¾äãÃĞ-•„g"*<ğ*(TPMÔ„;	€=äÂš/›GˆR%£±…  ipî‡QóÈkvğh·Q©œçšÔ1¯™å§øXX;şªfÉ PV5ëŞqG^O•Ö ü\$Èr<€[áå Ş87äZÊaY”Óñl…>6S ¡‚>Œ£'ÑŞ¶„İs”?ø½àjG’—-Š£eià«6Ù´6°~öö¢ä:%»N)®SKƒYxÛ½¶CrwC\_ÔS™èQˆ‰è¹oÓ|ËÎÕÁ·‡ß^{R®:¤TBîfgŠ*ç¼Cªàï<ÅÙ=#S‚B	%¤(Ç²é>á€}Br®Y@\üCèïC·OÈ‡N*‡Nêe21¦c1ö…£dåÈÕÎ+ri½RZ/;GtÁî^i¾[R·QR'—4(%²½Q±7.õ§J+®¹rd•]=û®m×‹7/ÊÕûäÒıJéş¥¡”õôêÉzb2úşâ;‹ëòî#Êî#zÙíI=ºÔ“EI£än„(»b—DìÊªªaµ€1D™hTˆF‰h¼ov¤õQ
+ú°In}ˆw*ÿ½ú_ª¥sÓò _ôë…25£P35£éf“0‘><}ˆ!Û«{õ&f´¼ˆ'Ë3' øÍÜ°ß´Ët›B·It[Š.Eg2]¥ĞU]•¢+ ğ¼ã `ï8Ä[ãÿtşÏß9*?}Nyúœ^&Ó
+=!Ñ›fÔ€ŞŒN¯5ùæ—}ÅÇxäÁ)í˜‡¶ÎÒìIÅÔZ‹T6±Hj­Lš<¯ß”©
+uAÚ.jĞÕˆ8CNxŞ„OŸò7cŸÑ]µÆÏ[mpñy1Ğiş¼Óù;8ù;-o¶RÆ;î=ƒFã¯$äıùhí˜bü …‰-ˆ‘*@ŒğŠ‘¢yb´À¹ˆU´$³˜ZÎ†B4Õ‹÷N",ø“E›h|¬€Bm9w5k ÿ8)JmÈiòz¥hÊ`?Ë;±fÛŸ§h»§ÛÖ-gÚö/«õqüª…èKÄgqÍÓí Ü
+~-ÎF¶Ç¢½ğI¨K]'Î¢>XDçv8ª¨–UtlWK4ñÍZÍìˆ³6M*Z;+·G‘G+Dëy×Í…eúY¼†´Ğ™×–P8Š€´\¢k{L&:ó½÷b‘Gw¤•÷}A®ÙÂö4¤EæÎvXç_Ú×?e!Q:hß) Ÿ39Ÿ;9piºwkŞæ"Û'ıø˜ÓÈ©ÀÛÜ\2Âû€s³qDsÌiNÅø#S¤|ª[@îKwö2ß +	ùWÈÏ—şŞ€JÀ×šLøu#|k`¿«á!~!nº }½À#3¤ÙÀ£÷šæmEîĞô¶Í£‘‰·ëN¥‘YzÿÖ+o÷…Àwà!¡|!àzJÉ˜ä®[9$37x„âæ3'{»N÷1q’ë;ÍğÓ¨Ğ‘şà"Àj²êHM¯ŞLU)/iiõÄ	´7éŞ_äÕz§Îhêc5ê¹|dOhğ´ÙÅsÀ;u K¥ù9D
+â/"2‹Htè¢Á/>„raDSRG^%Yä…¾­°|n©tö›ø!ÆøôÑã_FuÍzÏ~•ŸCE@^S€|£:.ã‘C ‰!,ˆğWaĞÑØNÛ¶#Ê¿
+^†¿ğc˜	
+"s¸–î{kßv¾å”½ÍŠ·A‹z¼FƒG&.UZ²5@\£×Ï(MGo%¤¦!ˆ©êºå•¾×FÜ·•¤Iúó‰®õËRYD™êV¨n‰êÖ™6ÖÍ0½d×SŠë©¥A„²v_m»Ò&—Ô)€´ìõŠ½>y99/Û÷Ô²®<'Y!&O¿?şÎøÚ¢ÜxDi0…Ê ş¹ *…@”…ìÆSTEM¯MHiˆ·^ĞÓ“N½ğëÉÔ/Ê”_¡üR&–² ·÷jÍ•Ù]«¸kŸØ_Â“gS®ò«+Uáİ>@ˆÃ7‡e×~Åµ_ríO¹*ĞÙÅ(.Fr1)×ÎÓlRÕd2"èNK?îşHüDÔ¯€Ê®óŠë¼ä:€
+ZÑÛÒ) *(@UT_gk^Tÿç#P¹*JAoóiÖï÷ìºWª|â­Sz*Ó]
+İ%mÓØ	Xe°Ó'O-öIS×ıãgf\|æ!ú½æÏ¼F”ß‰£|•–¯µĞÆÏ,0?7“oÆGšı#`'¡W©hT{ú³"8ĞÊÒ_*éª8¯šÒ¾®âÑ:¬YUú2‚‡u«™:ÚÛ¥­ºÚÂ§½©c¡rü· 
+:S>²iÄq<˜¸uÉ‚~)LKP¦Z*Œ)ì TSØ©0¦0û’ö»o«•lµ²­^±Õ/Q›„;)KjáîM¬ˆx5 ğÚY…£qü:ªõóZØú
+--- Content of ./.git/objects/6a/5d549b3d74a011cd1502fff22b56934d094b59 ---
+xÕX[oÛÆî³~Å€©!2QX;í)Fa×Jb4VRËNQÈ®º&—ö6¼(ËeÕĞ§>œ_Ø_Ò™½ğ"Évİ·
+†E‘³sıæÆ‹´¸€ÿ<şì³GP)‘–_d<l¦¯Ãù¢×Ù¼
+ŠÒ]IŞKd‘AÌW"ã`)ÜoûôbyÎ#%ŠÜ‘”,á³—`%ğ<ª”½aN±ùÜˆv'Ò‚Å³Œ+†ÜÙ,Ãç"¿¬UI‹ËK.{½£½·oÇ/'°›øA¯ó.¹šñ¢TÈÙ’¥’G…ŒıØè;€D¤|–³ŒÀ¨Å¯¨`Øü(¹0ôÃ<	c~Q]úŞi‰¬MWü£zš±œ]ò¢J–…U@ÂUt…¦ÀH÷Í–¸ïìBâMF¯GßÀcxqüæne–ğÃ«Ññ¨ÑÍŞ*½šÅµPW`í	dÿ¢J.y¼{"+÷ÍƒÆnî…60¾Öe ~ã’ Q”èeq²í)mY‘sô5=s‘@^("íÊ¢ç’«Jæ0ÆS3Q‘VY®£P¢€iÌËhº}	ú®AäN*ı”bN(;xşñ_8zón'¯'@~êp¶c)ÿ71÷Û’¤d8Å»ß†óŞø@3Ö<ùÇˆÏŒô¡œ0İiqÁ¥,¤Ÿx/+n `"¯Mº©¼Â_¶àĞöFpÉr¡Äo¼N
+_²ëúbÖ¤ˆ¬Åóœ©«]r³p”r–£go–Ú’„ï˜]#öMÎB¹ø•Ç¨Y[’SråèŠG+ÁÓ¸Ä#V¢Ö’(‚şdö/RMIñ´”¡P<+}«§	Ú÷+K+ú¶51™}Ç«Áâ¨Ì	äë{Ş@#l Ş6~†úÜ>ôÆ_ìy-$”Xä7ZÓC'&˜ì2kÑá÷?¸qf-A§"ªZëB}íüG¬;å„n´ÍÕ×ôMt"`w<ª¼3ÅŞóÜkàG„ôAb5©T,¸¯¹¡ãmí^±Úœ ˜³²¤db©ä,^>"îäQò´lÁİ¥o-eV*‰!ÃÿFjâ%¦\J>O*ãÉûOñß³&~k|‡S—8`ªgÖ’0î<?G.[?>İÊnÅ°õj¸u4Üš8Ä9~<]u[’²òjƒÇ´ö(u‡|×R?-®¹Dõ­ÚoÁK2BaY¥ïúWäŞR{¶»[×!®$£ÚµAŒQ§@Ìó°äLFW¾ôü³øI0lıGq†ëND4›uX[®°\ày”Éç‹\Qù@¡á¥,ª9&á:C:æüs…½éË¯··á	dxù5]”@É=Şcir·yDñOì£sÎÆ;#2P6ãóÆÇ?)Jß|Ş5`sÚ²œ]”Í•ûpSb¸3N%zŸ…çO‚³ò±´ÿéåş§ïö?íí¦±òğğåøÍñèÛ½Éh=şw{<¯Ğß6(©6’Ö`A†',RØ°m|L$Ş¾7„ÁíÏ¿ÓÛÏ¾ºƒæÈÑ<~üì²—Ù—.uË!ûÂ
+ÛÖ‚ì¬ûˆôvøÁ¤òM\Ñ7f‰±ÙvC¢¼gŠ ’•ÖÓLs&KŞî7z0ïëF­5Xö©;µ{ñ[onz˜º¦r!ÑÇ
+Á(/+É*C¤mïÚGú$(…ã5«Rå{õ0ƒ[ë×Şœ‚Æ8]{`è‹2¤Ñ$¼`%§™ÛŒšt‹z­@·I‹ÈÏM‚PS‚×¢+)òAÚœWÛ.&×óK—Ø!%úè]­›ó°×ô=³q`çåRÍrNCÚ¦}Ã1Ş´n`£–‹™¬òİ›í-Ãœœ0hnÒ8m†Îy¦nzŒ‘Ø]×Ã£ßRåö)R‡—"d8Şê03šù¶Q…\'8®§B¬*´#Ô(øÚ ²Zs‹UàšÉ‚ƒöä½Ğ["ögr=üùûÿ!¥ŞËj;S×ôaRT2âz»Beks]ˆ)L˜MvXù"O
+şg&i´ÒiàmïnmûµUı:_úAí³–PgNqQôkÇ„86×}Y§èsßuo=j]iÌ%ÑöĞ)DîOû[eÿKRÊsÓuJ›nå‡)ïp<ŸÀáøäMÇğo6VÕ`À»½×§£	>mË\^ÇQfOÆ0}ÿ9“ rÉ‡ÔùwPïhò§MÂXU{!cs£i¬İPÿ8;>á‡¢JcLÄ®-í=¬ñ3í«‘¡ÈÓ§ıÎè¾iñş»»6z` ªš§v¶u±0"¡Ùç‹,jeÇî~¨q5ë[ï… É¼§-Y‰n¹5"±¹éwó:— ß$ş:ğë>¥—Üj®W›µ¶pš‚Ò¼¨1EEÄT8Í®:¨ß«Ìp“ÿ—Tc;¥*.çº'‘;µñ;VàâÑ um_ÆÌ0K5UP$uïšÈ'TXÛ¿§šòœÈ|z=€Å3{»U^	V%GÜlé¶$k¹è²}\h4šÒKs@—ßÃ—‘B·IŸvazÌ°°*òË4ñ~ÆºŒo–?ãO|õ¥Ù£Ñ«Ë¹v^·HÚGa]"qe™: ™®ø¾=Ø;9Íè%à&£h•¾Z©À½’ÔXé]ÜÆa+áúĞŠGŞxpÁ³n7è¸Ú¼¸¡òoı‚v˜Ù7Pİ¿SëH¥Õ;:°ò~ñ¾šGGp&¥÷Èa´©îA·öêÊwÃö@«‰ë=å¯%Ø•@#¹];b1äzïıŒÉ
+--- Content of ./.git/objects/c3/bd020d0aaf376e409e755e9552e066f8ba4852 ---
+x•[lÇñ^$-‰¤HÊv\Ó–•ˆµEÑ¯&–ÕÄÖË’¨‡cÉ­,ÇÎ¼“D‰eïÙéAŠØª‚2Aà8p>Ô EÜJÂ)ĞwÂ"` í‡ÿ¸uö(¾$1h—{³³³³»³³³³³¼]õœ<yògÄç»vYHûCoÍ|Ø?p¥¨Mäi/ ËOğd˜˜È—ä	u*LE¨	ŠÌÓè	zšàéOÉ	†gŞ'&¼ ‘7ñÆ÷É	O^ö	tØKj,ÏI‚Š^³Vßøà#(4ŠraÍÒ… aºfŠñ¡©ë:^Û
+emuCâ¶ÊzÔ!.8WÎ¡Ê8ô1Kõ`aİXR|4|O­ÖA’Ì@e{âÉ$ññ1u$ˆğåè…âéi
+kC*µ›¸
+lD°$1Mâ2EUÃÀ3e£»É-óî$IˆHÑfBÂëÙL³°¢|JR°Gğû’½´EzŠ©*‹9ÉÌ
+ı3ÆV^V®¬Åò+jw‘a'¥ºb31Ëğò™*õË×”ÆKxëûDÒ1ú•—•²lÕÊXu»$giœ¤1SSª•°ÊÑ+eÜqe»ØM\¹Ÿ2%Mki¼ÆùÚ{Àı Ø#³«ÔZÂ*%H± im©µ„%ÙJéRæ¤KûË8Ì[8,I:PU?uIÓG_Ÿ´À:™Ê$‘´$é¤©¿)VÁ¶9‚y§n~XµŸ]ïçø˜Ş:ëÍ/¢mM„ä)­é¦j`$[‰VÂø†dÍN»t	¼ZªæFM”Í—äq¾D,I<™s8q¸çšŒK¡è´G¸š’b±°'"Hx6(8)‹zbÑvÆXTël°è#@|Şğ=m°LLƒ/¸bJM’X®ÛÔMæ#Ÿ“­_^J£|~Í0Â¼ˆ­ÂãyşzÛL,"´¡… ™¿*„Ãmİ(65v­í<ŠM#."¶¿.ÍÄ¢mì-óp2†¦¹h(! ¨çeœç( ßüõç–pH”‚±Èü«‰æÍ¥LÂºt-ú:Â± _¤À†íMü	€EBnÊç•Là¾!ÈŠ¤§ÀA$Ì]#CCg‡»Û=ÏIÏ˜—ÖjƒÜ¼GÂd,.ÍÇ%‘`RÍœ‚s	çnÁÓÃ%˜Ú=¡ƒVA…6@Ğµ9È2ÂÚô½l)òG|+Üm[ÎYùÁHùTyÎ’Ôo¨›m°7rC»†wÇ„„ù04C8¶  /ì¸‰œÓÈ·E|“x<Ô %¨˜ÿÙ\ĞM| ¨Øy1ŸÿÄ<$½Å-‡–B:sAqµ¨®–u—oÍåS\~Õå_9PdFx„ÄáŠpaØz¾d®sÂu±İƒ^Àî³Á 0/AsaÇ=S1äy)A¿ÔîI¸/³Bp‡VS/6J`k|ÉIĞ'å=¡hq_ÂVÜÅ).r¾İãµk^¸ŸÖêzÆû{ÇFF'{û{»G5f6Šj1~uÅ‚‚(j4ŠG5cŞ 4ƒ(¡Ğ<p‰±(Ö6Ç‹š!$	Qc°Uj^Ú+BØ.5zZ4›F/ÁÚ‹Ö¬™{®áåÂIÕLŠÂyöZ5ó'BšÑŒáØô´€4œ‡åó±Ëd„›×ŒHãaI³Ïâ4K´¨a„mQ£Aš(^ÒHAÄŞ,¡˜t“ĞlÛNú90bfqLx‘È2–_¾7(Û^ Ya*™@¶n÷İr­'Ôş<	¥Ò4¤¬’_ŸÏ_Vj//+à¿;úûñßg¦•}>uŸO¶ù!+ÌQ•9*3G×ÙûrTƒÁ¿aÛ{ç'ÓCfõÄ’lSlcªm,mÌ²µZ?°ÊÎû¿øòÊzë™µÖ3Jk§ÚÚ¹zbµkõ„ÚÚm6 ²™l¸÷ŞId^ü¬UqûU·Å¦º§­Yİ”W­ëg.¬¹ œSÏŒÅ*Î‹ªóbÚRœ&ğÇC+‰oŞıê]åå>õå>åX¿z¬_v +ì ÊÊìà¿œ‡rD¹ÌÃtOÖî^n]jÕO†½Eµ·¬Û}kvŸb÷«vº+kaÙ·äË8{³joB=G°»úÈç‹QqV‡oQY‡3G0¶A2Û°gypiP>Ğÿğ$ È«ò¥Ò0 6ÈÙ[nõİ½x{äÖÈã÷ æ€¼:š/•†€Úõü¸Şµl]²Êûz3q ù¬ÔŸSëÏÉzÎ¹ñŠı§‘°‚¤Á_X9µÔÊnßı£  +l›Ê¶ÉÛò3H9:Cù¸Æ±8"âØéÛ=ÇÏ9‰GNKI?Úßx®ƒ~Ôa |›KÕƒà#à—	3¸TtP*sI¢òÎ”µÁ,›	\,ĞKá1¢xb”Ša$AÌâYôÄS?6~¥«N‘I½×;¾H·%~K€)›¯ÄÌ3<„×÷`şER”TlÍCg.WJ0JDÙ&‚$pÈ0º$`ÌËÃİÆø!iÌÑS/E…Äá7øwN¤.·¿Ñz°ce˜G¯·—Aı†{N¶£zö	¾îÛš/µ6GZ›yOs_{óP{ó¨—Õhp‡à,%IâB¼…ğ•‡‚3šaÅâóy_ˆ×§±À.^_4jÇC„“€Ñ\Tà+®*Ô:ğ"~`‘ÈQ¬¡A?.¤¹ñ·Á»M·gîÌ¬»¼k.¯üÓNÅÕ¥ººÀPÍY‡ûÖ‰zû³¼§ïïM?ÿÚò·¥~T­M²5õ9‚2w‘Y×Şå¹¥¹ÌÛÑ;Ñu×‘5×‘û£+M+o)®SªëTúÜ†c¯ê8”ù¥ì;«8:UG§líÌp×g9#‰Eq¤¥´æ­©KŸq¬÷Ş¡N+qÿìA€ßY©N,n.´âÍÅõ§x3ámG Ó•F·³WÆ •&¢ÁñmKğB¤wŠ2q,Yµ•¤vê³ó+§ás—Ş
+ğ~cĞ?á¸2ÕŒ¾RzˆäUyÿ¯i/[uÜ-ïÁR•·fÛ¸Õy­[y?®Iªh¿k‹æğ‹pç}¬MwÚ“¤q”€W>¤›Iu˜ª£¿œ¶ÿc ¿:L7Lú«ÊÒ«Cw(õÃ‰İEüâ(ÅB3ÿp¬D×Ã/Ÿg]Çì8š‰rÁ3Å…ÃWá=¤Kø[tWäÅÅ±T¡¸<	éµJÚfí	víº/B]€=ÁH~Ÿ`ï‹:1{Ø'8Gİ ûÏãgEy0‰b‘¢@ öü§Îá
+á¡Y£#ßæÂqADñ¨ç0èÃ ]„ŒùxYtãÇhlaÙàğ„°µ¢ n $7UğUÄ8â±|8æÊ÷™Œ…yA”Š#ºœxñ(b2S] ×­kËï.½«¸[Tw‹âğªoš-0§WeçiÈ
+Û¡²2Û‘­s§ëBºáÕ>Ù6YaFTfDfF6¬µ7ûeWÿ¯(Ö1Õ:¶Ø“5Ys„Ép:GÍ§³»—Ky{øôƒ€ğzæâç—?½¼bûäÍÏŞÌSV„oæ¾š[=ğ‡è×Ñ<e5şèïŞ‘GÇ¾½ñı<I¿²>\Ê¼ ŒO©ãS›ôPt=$­…$9ş¶ZPCyzºsÃ½Öxß.CĞç>«ºÏ¦û²Vû‡ƒÊ»{¾ ²bíU­½²µ7ëØ›y¶Q×ˆo„Ó%Pìrj…“wŸ‚¬XÛUk»¼-oÆ/æÓzü‚¼¿ø:w$¾?hé©¥¿?ÒØc¦ÿb6 î%‡Áša“òÖ¢Û¾½P8ªÎßjx/¾+ô·QşeÆvDb|<,¼Š& ¼ø ŸH2KØäBÎæEı—%öÉ•9KÔ,ê¿Ã8(7Áb]Îº—lÈEĞn!á
+,‚Æz\­tÿrb/»
+--- Content of ./.git/objects/98/869d85c16be160aab75eb44eb3674e32dcf58f ---
+xVmoÛ6Şgÿ
+B€a	³7MWL@0MŒh’¡õ€®aĞÒÉV,‰I5Éÿ÷İQ¢ŞâfÓK<Ş=¼{î…Ş¦bË.Ş_ÎJ²BHÍT¹-¤A©Q-‘0Š¥ÈXÄ5è$VËíÚê=(‘F7}Z,ïï?oŸn>_eWl5bø8×h¾Dó{™ì’œ§Î”9% ”vhu+¢$~®V•Í"Ia QÂÏˆ^Ú.%}M#êj2‡NèHFëÑ(‚˜Á“Fs½±1*7FÅMÁõ~ÊR±Ûôãcµğ#Ø–;7vn ,u’ï"‰µ)Ë@sÄá49yÀäÉñV(²ŒçqæXs"föà¬ÙÏl;34‚4:9,’™o–äl@z¥l^Ÿóóãıíí‡»kôbÂ&şƒHr·>İ#oŒ	¿ÉxşOF¢ås5eT‚*S›mÉø²lp¦,ä….%lD©‹R_-e	S¦‘Úú3ÜCx0ßUø: ód7Hä’ˆT:B(t¹:Ù¯Öø’Iáz«àİ|¾¶T–%~#åŠQ}ú©à‘r{ Şj^QD6¹O“€²p<øŠ”‡à:ŒáxğÒõöİ¤à0ÅÌ@÷,?Ñ)×«8#ÔATwí!ÖàYahi¢´Û:á“ØõÚœÚk©oÓCšha˜2ùa$&±¤LOÅTçühQÚ‘V“bÿ(’G¦xh$°éuûö5F¤_BĞÖ€­a…Æ„Øf4LêN˜ i‘î¦ ìcKxe8X#‘îLŠ*ø_|_õCºr}ã‚ºš51ajŒ²ÄYĞ©-¿ğD„`_Ğ‹¦	W¬@ıÈesÈÌ¤ºb3!BÂÀ:);47ÌR§WÃOÍ`ÅPo`£T48°Mª±!¹Ôê1Ñ{×uæøPë¼ùõ½yß‰¯6Mµ´×d'ã:ÜcÂ$ø
+¸÷®t¾EÇËÓ*ø6[ã×Eç‹™uĞùÅ3­Cmñ¡Ã¶Ÿí0›†7›şNŠ²pç^Û2™ÂøsÑb‘ïúèf¤Q„ÉÀ­!1îñß³q6Glü{0¾Æ_{IlRĞ]›+IAŠÅ·iª½˜\[áöZšb»§ó®ˆÎšhÜ*¶GVˆUà8ÿ­‚ÿ§%ĞÔir1¨Ö?]pÍè"CŠËBÚúêd·ª»e€x'Z8S÷>[Êg:ÅFÃb¦[¼ÒM÷›»“‚´©–‰kÊÅ£×ÅÉ¾V¬ßú²z5i¹«BY.½ò§à´¢ë»•óÆ;Íz‚‹¡à­wb=Kïôï†‚_ğhòA'7|àL«ĞÖŸV¯”YÓ3ÈÁ\ªŞ”¥?}–~Ì­=ĞR^4M`·'ÿcLñ`QWnÛ'–£š^B
+--- Content of ./.git/objects/e0/f3762ed3f2944dbfae3bd0f19d068fa05a6a50 ---
+x+)JMU04³d040031QH,(ˆ/-ÉÌ)ÖK.¨,ÉÈÏÓ564Ô+¨Lfè8TQ•vñæ5İæ»N]›İ²ÁÖª)%)>9?//5¹$3?Cãé¿7‡ùk?J×õ-¬ã³x¥ÔÕ˜›Z’˜’X’_XTœZ„¡õğ^&^®õæyóJã¦=Hû±Ë# éÊC
+--- Content of ./.git/objects/88/c2787a66d1d9c410ac8b37bacad69b84b03d48 ---
+xÍ[lÇq—·$”)J–TÛq$Ÿ%S&íÈtìÆT§][2‹¶ìôÃjâ¬;QTH³wªdâd†6…Ğº…Hğ§ÎÃ)Z šŸø/ŸwÄ" pş©p?÷§³G©SÕ6E
+´»w³³;»3³³³3{+¯ÜNŸED"a¥[}gîo~„¾b·øšÈ³4 ‘„$œGÓOc§ï›öAëËsnšÃ™&wMû%0 …¤À=<”Â-/áë(ÑñgÆ<À6/‰š¬å
+ònÊcM~şg—>DÚ6Ú|×Ñ#À·úËXÇUWkÆ¥U´†Ğ<ãëïjŒ´KY`FyÍc·ƒªº‘°—×²Oël“çy¯n“à!°ßÕœmSçb}“¸OÈ#ØáãÖ.Aëİ%u´9´1ÓÑ{Hòë>€µ¼–‰ÇÎ{ÜuÚ.viIÛ¡³_÷ÛÃêm{nËóhÔåKA¯tolÒò	Ğ¸Û]¥ï¼å€øF:ş#y¯to#ğİ½®¦Û[İÿµgvÎ”B:Îô¸ÜtvóÂé2»1+ŒÄ¤ò;ÉT)İR–’”™…‚\ÔÔäe%«&ßdWS^Ê©ZFyÛÆ™29‘W²åƒ±x^ş‘œ/Š9¡
+#B,^UUÌB¯œˆÅEu†İå&éŸNOôÚAà—Í³v(+k 3+S›Weümÿ…‹ç0AÙ]µ¹¢²$Î2Ş¶OQmRµ9;,/•Ä¢´ ²¥ñmYÊQ Í+¹¢¹®QY,\zÈœz[µª&)š½ÄŒ+´ jBm´c<——İ%aQ’\<T3‰YU‰ Í‹¥R†YÀ°=0á,ˆe@CgWPÃæ”™vv'Œƒ&™¹¦*{Ø¨ÛSY¤åùÉ9¥ 'éâŒX(İ’óùÖé\¥J–Š5yõ¶6§“ØªØ€…fÅb®,Ó$ÓkAËåÕ¥Ûv6¹PÊ4­LA“¥^‡»QA‘^+2°ºdFâV$^¯“ğ¯Ü½ò«‰“&´È AŸF÷­èïŞY¹³®E‡«e3zÊŠª\ÚèìZÉ®w
+µNÁ8|Îì|Íê|­2±A÷Ş¸¬1ÈQ“µÈQ@6¢İ+‹?×ª¯N|È±|¿{µÑ4£ç­èùÊ¥§}/Z}Ç~sú“1³ïŒÕw¦’®“½ëä`\›x4:f‘c9æŒª‘C¿ZÂËÆ©+¦pÕ®šdÊ"S™zÚó‚Õ3\]2{NZ='+—ë¤k¨‘kGß1IÜ"qƒÄÑşé_ËZIãäÍ·¬·LrÓ"7róK^'}5Òw¿h’˜Eb‰}šcy“YdÈ Cõ}/VÆ-Ò[ïè®L>Û¢™V\†Ë N»È×Ía»Ç#U[Y˜µŠ77AL‡øZãş! ¸ù>¸ùÂÅk×®\„2g ,3Ù~™R…Úş…RI¦	eáŞ6ïµÊ¶$ô03›Á%‡~øÕï ‡"XlÎ$‡,rhÄj$öáşß|<`&F­Ä¨1|¾ÏÏ6Z“LZdÒp?:<ï›QŠ³¹lÓ­µÛ%Y=1¯*Åİ_‚%QÈëu°€7?¾‚–±¶Ívó­Òwäìö’ê]ÁrCèe¤’Eßw-bŒn Ur(Ú¶÷ÀD‡!óoËñíW„äs2/Ç2/ä]¸ƒíwF9ğœÀqÙwÇw½Ù.âEÔ˜ iÓ²0î^Ğ!¯ˆ’àÄ Á1“0K•‚Pö	l¢”ä"DA°œMØL;tqiF.i9¥èœº\iBo‚³;6Ï8ñÏÚXV™µ  5N¼‹1È8¢2(ú
+#Ã¯Ö TĞ¦Ïïß»é¾|U5#CVdháP}g£gßƒÑÕ©_œ{pn“ƒg¸şÂfı•öØnØÖÖÖnÃí±­§½›ÈçßÛ|t%jìŸüô; àûâp£5ù´Å§>]vÿ$Ô® ckÓ, U_…mİíJ!ôËŞÓÜ£=€üœşäølğ3†<AáÔIîIø`ê8÷$†~ÜğyË…5r‚˜)ÀKïâÈÌq˜©Ÿ}	àÿÎ‘‡ş…#3Şñdı·.Ì¥éqØgyğûÊB^ŠŠæ:qÃP‚k¨1¾e/Mzšoğºå·šn¹ÃÊ”Lê ¶9ç‘UîİÌJÆñš*şß»æëŸNû_‡ÏäSŸ2øÔÃ%GÀ%÷§âÜ“Aœ<î˜À4¶€ækB¸œ²‡¡óÂ¢'6È 3sÅS~„œÈì„‚çü¹‚"-äåïÒ1˜„áW .7ÆuÔYqj…*N­£pÅ©uÔox¿:ê¨8u“ôb¸¶-ğÆigÔ† ›à]Ş®—êèûw·?
+--- Content of ./.git/objects/27/dda8ec7c477e9bd91fc26e81fe43dfe08a6df3 ---
+xKÊÉOR05fĞÏÈÏMÕ/*ONÌ-HJÍÉÑw)Ê/HÊ¯Ğ(ÊO/JÌ-Ö¨,ÉÈÏÓO,(ˆ/-ÉÌ)Ö+¨ ŸÎ§
+--- Content of ./.git/objects/d0/f275fdc26ee22e5924a82649d5638c5532d19d ---
+xÕZYoÛÊî³~Å”†a
+UèhjT½p,%1/õ’Û[A%hrdóŠ"y9¤îoïwfã–œE‹
+°ÅåÌÙ×İdÅûóßşéw;låÑ-¯ÄşŠ'iêÛ |ÒUYT5‹ªÛ2ª7÷âI˜ËÂ^‰æ¦¬Š˜ûäWQäƒEU¬XÕwYzÃ4¾sÜªITó:]qóÆÜôYq{›æ·
+8*Ë°©ÓLhÁë¦5ÌˆÑûE”f<±¬ˆ’P	T?•\Ø'u$eY±P˜W\?–bV-şŒÇuXd	uhy“"%7a\ä9Ş§Enè'a]ttµ:«¸"%gaüÃç–×!LEæ4ÿ‹*É×i.xU‡9Øğ²)‰Åp•
+Ñ®^¤<KÄ`èR_@Gáª¸çVRº	é1l¾`­ŞØxÌ¼/iÂá(,a.ëbéKDdÜ¡zIXTí[R~ezU˜¤Õˆ%ÕSX5ùP"İº®â«")ròìz§Å=_z,Í™eé›8J"qG«˜¿ÆÒö•<ü›ˆßK½ş íˆÊ€lÀµyø¢®|Š4?”–ÃaPqQd÷Ü°ây­¿†ÃÁ`ú÷«ğäğœ_„?Ÿ~œ† ¹Ä{D¯¡¸«ïß5ücÄfs`úr<™m…Õ¾¤a¯'ÇÛa›$-ÚÉÙÑõÉôôj+æI7+Èd@œóãÓÄ³N½à‡dƒëËéEøéìd
+(ÒVpW¬  Áç³£ÃÏáÉtr|^œ]áuºoƒbp1=9»šv½ıU“QZC>õåü¥ÔY»ê<ë¦ñ4dk^@öùĞ0ûm b`prdğµÑ³ô*]^KpªÃ­Ãªt¡R‰„‚óÌ²ß¯,SpvYWÍ‚ƒKËò"@˜ÀVš„/L>]ÔE‘ÉœÜÍJ·(|:wÅÅ
+¥/Ö™‡,WÀù¼7¿â¿Í*s™¯¨äğ*HøMsë/¼‹&Ï‘q™FqÀÖ{l/øµHs_?>{*ÓÕÕS›`sø	(¶µ3@N4‹F,JòŒ°hê²©ÇWUÃG¬ææ2¾ãñR>vò¨®e@K8 ×¾"ˆ:®áì­’ƒ’\_–èM!ş†B "™K#-­P«ÜBIÕğÇ˜—5PĞ•ÆH0'jjQEƒî,-U¹Ù¢¨ØÚªû”ù’ëçÁÀó¼™Ø”=Ù½¨béëê<Ò¥,EG`0Ï¨- ÂD–´åhü!BöÖÒ’µ]ØÚ­§²ÓÂÂ°ºĞü(AT%M“—"¤¶vØ„×¼Z¥9g÷Q–&ğ4ª×Ì„@:c“÷ğª¬Yå}Zßµ¶Yò'4B9y´äaŒVCù€‡+#oÃùõ\%cõˆ(6h½ZiÍWÂwªù»\¦%yv™ñÇı·LOŞd™°5KÑ{ˆ:ÊcîKô#æghg ad¹áa%ë{­Ó"7
+'Ÿ¢Ú(ô?šuÏØ;*rô+äXÚ7¥üYºäÌ;ª8êÿÀ‹å½lØ<‹Bé%Ì#h•2G€ ó«=ÿ§¿üşŸCÿ§ñìğÍ?æÃ½ÛñØ‡^Q‘0l@¾4G¢hªXõNºC2ÀF
+â^É«‰|‹OÛÊTlwÏÊ|DŞi´j$¯¹§‘è&ã­£j?[ryÄñ„‚œ&€íîŠÒÆYÔR!%G•äfo.ñpWxnÉ±4os%Îo¯ ´ğ®Ï'‡WSCBñ™]N¯Øº¥ğÌ~ş4½˜2Ä„D+ĞU†aWë£–—ûÌ$IÚDağ‹ )ì%‰A¿ºK}¡Û4_H^“‹_Â‹ëÓösÑd‰‰|­F%UG­ì!­ï¬tIèö‹A®ÄyÜ –´‰MŞ¢4ˆKiÍ—ñ=úÖRjV¯åptU¾¹5|H¦œá³åUç%Í2¡ÿJ¢w8àUUTĞÖ9›9)²CŞdzJë2¯SÚa’4‘ı+jXQ`
+£áçÕEÎuN'G&°UÑ–)²ÁC”--'¿õ\á2d)3„Æ8	C¨)‚Í!Z§ ×`	~
+J%5‘¢ÌJkÙmgïæ6—¬ùÀÁhâ¤¨‹• Ÿ¨"XÌ²«P"7]“w]ÉéËˆ\D³/krÑ”4àóò6éúTSõ$¯‡Lz%|…fÄtÆƒ! }e°kSt;^h˜ oMªÈÚ'sƒä~SnnUhSÍü	«mK‰
+ú×XpE½’‚W¨¤x>[ Ã”	©İEÙ·¤§/İƒ+§RÄPU×º¨1Ùì<=e­ˆ37=ÌÙ­—%`››†0qk‹ğ¤MD4$wÛîÏN'Å¢e1y2¶åI k;¹BàÄµ)[Jyª¹¢L%¬DíCE´	!/›\v%òú­´Îu)a–®RŠ‡wê¡Ş¶ïÈJuºqsJd4ytšn!9Ú¡
+%ŞÕïˆ½sd/+¾Háõ”<[áó~G½ó¶5èh­ğ<³sµıèğÊ~Æ6ÃÂ:Eè™5¦t·KóèvÃäÚ¢GíÒ°iP!€ŞzujQö!B`§ÓQÓ
+76øºeeÙM/ÃD|Ó—¿~n;cƒX[yZ–5ug—½7lÌ\çd¥–Ì%Õ‚fßÛıå`wu°›°İO»'»—k:úh{™ñëš¶»,:föé`4K{¯m÷ænVW{(í@gX´8±“‰}PT Òq#évêó×™5~4æé½MÄ²Mµ€˜„‘‰¦Î±]5wı·×”èÄaí ÊdÖ¾2L˜ÿÁÛIäİ¼@,õÌpDÃ(Y3Å0†h¹I²aÓÄPŸ¨³nÿró³—óÅ¦1®uLYYùª2®óA¶¿–Åi_C#†f«!ÉTÆêÙMc¦Moã›šÅÈÌKoî¢æÓ¸½¬à=-cØ4Ë´bÁ®éá³¶L«äÛcÚÍÈ›˜6‘C[ƒdkúì°÷r]d¸³O¡jªz.Â!ûë˜9… kÓHÉl:2B a¹(ºKˆº~Ûßún]Co“_ØñŞ©)*ÉêiE!2ôQ¤PÔ^Ëbg<ê‡¤
+×!¾Kf1Ji}'¬ŠÊé.ê—*Òo7 ´jzÈB}ŠÚs¹ïjo‡}Hsêƒ¬k}§—ü¼£ëÒizL¾®ÚíöûÛ­c/)W· ôš©Ë¥ØÆd‚†%Œ;mÕÈFÏxm4†nBÓ¯õéJ3^ë‚2í$àÌ¥¬‚4“Üaw–Î­hÂ#Jåj/Ïéæåˆb3A›©°Öÿ¿}
+y‘hgj‘ŞÊvLWØ¢UO„:”Í ÒÕâ'bŸŠˆÛÿ«Æ?L®Ë;º#ÂNE_sËd£	btâè/bV·,õ¹Qõğ›g9LqRe¦ÉØ »
+5sf”“U³’åô÷v4­ñÆí%
+Y{a÷\7÷úTvl¢ƒÃêVöœËvÌÇùl\¥r¿yì]ç)6·vBÂNÔé¶.
+S%IˆCm‰Â÷Ş¼Ñ'8B–Ç¹cOÔ¶İkÌ¯/Ô' ß¿½/öÏ¾—ôı?°RÛâVJ£¾¶Š¤İe­ZùEÊÅ6²jT áØ×û2¹ş¹V³$PZ¯WhÃXİ©c“í˜/_™ÛM B´ÏĞVK–àæ3¿ç™L%ˆË`2}ıQóÜÙ…s"¬™Q?–ˆhl…V¾÷¯ı`õÄùÂé²º‰•ÀØÜ2Ù¬IöáVJå‰-³»1ñ™]‘íÑ…s,çrÿ‹:ÅÇ¦­ûôN;ÃÍ¯ô9Úü
+íYï+@&ßºVüÑŒaÒ-Í¢cÇ.ıÌgŞé´ì4±›”®¢ø[”~®º­-íwWéş5¶gëÿ:üÊ¶oûœ~€£÷Æ0mvÉı`ŒƒÙ“~½€Á¦ößÁX0R(Gà0”¿@	ñ{4C}Â¢jÃ`0ø7Ë³­
+--- Content of ./.git/objects/f8/dbf78d050568c1dadbfef53264eb9c402cd1d1 ---
+x+)JMU°4a040031QÈMMÉLŒ/©,H-ÖË*ÎÏcX«ÿÜ»ïÙ¢øZµ9~ûİŒOóÓ‚«-ILI,IŒÏM,(ÈÌK‡ê°ÿ‘ñ…7Üëß^ÆÂºz'k› J'ˆ
+--- Content of ./.git/objects/64/cef4db31ed8d68f29bc4d8693f6487eaa0a7c9 ---
+xUMlGYï®½¶7?qHbÒMš$¸MQ+… %¡Q©P%‚ZïÆq²öZ³’Xë*•8€d©FŠD*‚äı¡$.=V*•zh¥5r‹5’%¤ª‡Ş\‡ª³»±Á¡í¡³ÏoŞ›yóŞ÷Şüx^Qç…Ñ·Ş||Éó^@Úç©‹wi ~·”F£v„'£D¸$ AÌ9=œƒ¶NÍQ¤§Wš£!‰¾ç	ÃìŸ–ƒØ0ÄôiQ_œL Íf…u‘ß“Ç$Ìu Ãæ0à-¢İn”šÒs nåvs u¦©€%Ë³İ(Áo©[$ÆíF: Œƒ"¼x$O·Ä¥ÿG\Æ`J/æÕ¼ŸÖ£ûšS`‰mÈ’Ë`n ‰¾éjAáLKFîÆ
+ƒiµ½@òÍ³ywŞcxˆşskÉ‹m]ap9‚%ï5àä3(DILJlŞß‚ÓÓŒê'(İ†—pá»nîBAjJi—ô®†= KöÁ²tÃkø^Úú„-6ëcx[ñBğÏ˜$ÎÂs“Úm]ø,ô½Ï‘4˜ç[|ğYÉkçä3xâi×şC0K{ÿ”/|ãô«p¬¹fÁ*,Ü5\¨»Åg³V’ÿ_pıRø­ïI€\>v\¼–Òô¸ºœóŸUWPB²ä¦¹AReMÈ¨º`[ÌqãÓ³ñé™Øaƒw‰mAFBr{¦å´zI–Íñ²RäÃBnß¤HIĞUÙ/Î9Š˜›~?VW©a7Ü†¬;„½òZVÌH+šŒ0¥jØ“—e)…4ÌÚÀ4ìVÔd2•Ib÷ªˆ2–@¯ŠÊ2¦S™³ÚâŠR0“P³ë£˜u``nb-!gõ”šÁŒŒŠ†Û°ÛÁN<ë"JÊ:vKh=V2¸ÍYo8ö9}Üª¦‘ªêÆ1c%¯a:#¦eìÒP»$MÇlÉ©5e­d&´´g³ÑE5-GÑjBLgçeE‰#5;¯®EO#5‰Ä´=½®/ª™hš¤/:<®¢¤˜IådM‹1)#mgBßÙŸƒÙuÜÖPâ60&Ñ­û¯=&ïÚ¨ñÅÈÕ…øÁûü`™TøÈÆdf/PdK“”éH…áá+=uĞÍœ€l~…­{·Ş¹¦l*‚î”ƒÑJ0zÅWmï}Ğ>p¿} Ü®´‡ë€âöÔü]…ÌĞû_!Ì¡²ªâŸ2ıSUà~a;YZ.÷VúGë “;~5ve¼8Pœ©îİW¼5lñ"mÅ>tmis©t¨Ü_tUƒ¡-ıZºèz85{ŞİêÛê»3]dkİ›şkî;NèN—ÓvúrÇX¥cÌì{Øİ_\ç	Xôn*u•åÀH%0bFªİ¯×³ç<¬StÏyXõoO•_Ä¶c[±Z(¼}Êü¾‹0BåĞÉJè¤iÓÓÚ«Cu É’¹µâCsäÜOaÂ,:3íåĞL%4c¾DOI«»,7–ÀÙ@ü 8HœÚpû6O™ÇIBÇ	•c•À˜{Z°ÊôÈeW’·6ÍÙ:Íz™~8úÆø{oÈ;äîöNtr?v2D¦&'‡Yd=%¨İbÖ£ˆİÖWRóö•´ÏÏ×à	™ è5Ây¦UiE‘¡ıDµş,µó„ĞV·aUÀoØ_´mØ_ì5[©N÷Aæq!®ÿy…
+--- Content of ./.git/objects/5b/28aade48226a9498ee40aa969c728737d39c34 ---
+x­:]lIšÕvÛn»ÛñO'1!4„ &@!d`F0À2!	xAÇİ	şÉ¶ÛüxÚÈ7šÓ˜Qtë±"w;#Y«›<D÷Äc´:íñpİ¨WøZŠ„téö-s³+ÍÍ½ÜWİşÉÎŒ´åê¯ªëç«êªú¾ú~<OÍ°‡‡ĞïœN‚°nı=‹Ğá—j°U2ß-™zŒ8Äq2R"Dèï¦IOÍ!³’!RSÜ’°†¬nkÛ¶MÏq*DA·'!G‚Ñ	&Ä$œ!§^o‰·$\!—·Æİ	OÈSéçy¡Ÿ-Şšğ…|‰¶P[Âòˆ'æÛ«Ó-uTs©	ñğXùÀ¡§ğ¡´­škLŸÀËÓZÁ|W5[Ï5ci~#ŒÄ4ãm‡²n~{iGWcÊQsè	¬îSxŒĞŒ1ÄşÕŞöé½ó¯övüHï]µ7ı#½{ ·sÃZìæ˜OQ¨×8'¤{ må\Ÿ¡½vyç†ü>ÎuA~?ç½­¯ŠÀ ¦`3&8Ä”şÛş„n<HhäDD¼)ÅED^Œ%ø ©9Ó¼˜YÇSss±äœæˆ,,„g#±8Ïiîx*Â…<‹„Åû|ZóWJÄ`ˆ„Ğ:¥¥?ÍÇù¨NÅ9>-†kZk4•Lâ*1…‹#3‘44ks¼æïÅÒ"`¨"ğÑ”Àií±dšÄp’¿Û\±-³€‡±tºŞk6ÆÇ¹´f¸•S^q<¤–Ó.–Òì#©h&Á'Åt´v„`90éšáù.	H—àLš3çLQ‚â7gæÈR8ë%Só‘üúzC	›'Zê}æñÈzLœÿYŸpÈá1BÎ,Ú«y„æk}%ó¼µZŞ<*gë¬V ¹åWP¹Ùü$r
+õ ±¥†íFÂŞœğPõ²z³Kè7ˆsHÀF6Ï„@15]Ö–³<°À!ÔÓ»Ä]tÏ|İ%‚ô¸FÁÎÏŠ©T<k:8ŸõLf’IØP6šJ$"In˜ı`§á´D#bFàÃ©Œ¸5Räï‰š%z‹ŞğvfÛ'#wÙ³€l±	Ş8™ÃlÖW+4N3;›Ø¬i˜Ú5ÇÏdæ4r>KjtffAHEùtZ3™$§SIÍ‚:œ¦´ÈÁàšıì½(¿ Æ Æv7"àÙ­š}%¼ T¥Y1ñ‚f«|ƒføt&.jTuRÁ§ñæ±zøáZÿ­T‚ïîF#‰…>ïR3©{ıBjNˆ$Òı÷Å[©d¿N§„¹H2–å…~X¨˜®TT^-Ü×<ÒÒX§9aŒ‹ùkú?äQÙÕ¹t´Ô)·ôåGË¤ã³‹Ÿ\”=C¥©ß]ûíµå9¥wPí„ˆ
+yB%OÈä‰u“Íâ]ól{Ô]²='W¾eÏ´â™V=ÓëZkû£á¥Ù¯JëµõÀòeµµ¿@•©–_1Ÿ3rÛ‰å{  *Ô°JËÔpÙÕ^p}¿FûÖ‘Éâ­Ü¥åó¹ıå ˆÏŒT¡ŞU©weêİ²ËS°×ßCX· HÓİğuÿzÚ}ÆŒ~ovœ9jş½³ëL¿ù÷Açû- £5Òƒ¦x7zàùn{ÀÄŸ¯å%Ô|ÄGĞÍ¼˜ræ	Db*5²@hÌ››úßËYÅjCHë,¡TcÕH²6Ï€3ÕÉ½Tc=šïƒœM²IÄ$ôl1j­4âÌ0.|[ıö½ŠZühËo†›}óâıÅâĞ
+’ãYÇT4¢Óû0û'¼ÄYÿÔí˜~“°™d:³°D˜@Ğ¦™€‘“w#ñÛ–]4R'5*½œ ºË^Š ¥QB*WOLĞÀ&ød¨5-ìÒ;â*kL±€'šš¥13H’e…½¸±;·RøN$ãÂzsá8_ƒ'ı ş~y´èújoiŸèS}ëÈfyG[
+d!Rl«ı}¥İrÛ>ˆ
+T© LË¾Îud±C{ …‘5¯ïÑŞWŞ]/½»JGï>Õ»oÙ£zû^y^zï[ª÷­Â{e—·8/»XˆkşGsã_ÆKG—}Šÿê?$»ëñµÛÿ˜ù’‘·Ÿ\á @TÜ§T÷)Yë4ÙRîwğ=è\´‘Çã; ÉwÿÇê3ô™é1’Häˆ{DÎ’³PÁ4kâLŸR1‚62ª‘|$ªùÈæìÑæ7(g–lp›’}³Û„³ÀÈxhx˜œ“³æZæPÎ»ñV•(ÎÖ|XGPÑtsÏ8À9OÎ[…’<0–Å9¾¶åZ·š•dlR+´¢%/ÌËœ4á·æo"Ø@8ó5Òİœ$%osïœOtâ0‚ä}¸AÔÍµqŒÔv‡îŠ®j+·ëC$ù9ŸÀ.=Å;¥‡œ_òQÉ¿Å}İÒ<²˜OB?øö9£‚
+Î…[ÔYÌf$½e_wóXÄÖ£x$ßf˜%sº{«]á¼[ô¡9[V3G/şß–3kİ¼¯ØVÿr`y>É;{Ù µKíÂ‰-ñú0^®íkóÆ/—Ü%º»“¼R;ç¯¯¯Ô&µÏ¾!G%o9b»>bÇ&#º¶±mö¹´‰^]Í³—Znë‹0(¹àÂÚ¡Ó‘7×!Ö§`µ:ğjI¤ä}Öùhái$1•=aYÉUj8ëõ•hæ @OµK!iÃIªÍhXrÃŒznÀå¼¹Î\G. n¯ã„YuÂ¼3÷´Æå`fÊÌ‹»a~ÒÌŠ¦Å}“•øÎ}K*18j@çrÛ$Ng—ä ¸]¢vKN ;¦y¿±!.èãÓÑ†=Ğ5¥VXÛï0¿ø5ÜsHB7;rDÓNÉ‡æf;D‚>eúÂ¼hYìœBÿ‚‚„~“-šéĞaà4Óì‚q?;ŒÛßÇi|èàBÎçõÛøÇI|ƒT½ğNvoEP¯¨…úå|èd<ÄÓï@¦Úğ Hğ}ÉŞ›F\ÚùÇcgW#/ò•_(Çn¨ÇnåËBñH­d„!èøñ‹¬ë&;#qVg˜Õ5?as°@Ö|“ıÅDÿÄÍ¬“¡« ³šã=Eu¬nãşÉH‚Ïzz¯÷&†{9¶÷üpï¥áŞ©lçÜ‡Äã3‘èm¶ª9ƒ
+s¢ª½QÉ.DP‘°É”Èftü=>šİø—^¸Ÿİ¹¹:Î‚†ÍÇî`á*»{dòzxòÊø0ûa*çØÊÒÖt(CaÚùÖµğGÎè%U•£eÎ¥2IİPatw`aBÜßĞİ5SŒËnOmÒ#Ñ•´†N†% ÎÍN¼à­7Ù©hˆÂıa6eH;•¥°F+üâ8PÇÈ§±\‰Ë(O&""hÜ© K3Ã†hd,9>	ö¶JèÃ[{€Fa+Ş2]sğ©QiQ˜ÅV]0_×¬`á“œÀàK4ÎG3“à6ã\ÓéTFˆòX(MïâF6n&Œ-"î‡Aß4$[Û^˜I¥yÍQ··h´‘×ŸF‹ø,©f3V“Ól•OÔ¨ê"höÚ—jôşäp<–ˆ‰S1«èeS±¥oæwO_cÍº ğ³±{ÕV_‚^<oºzÃè´ÕÍÆZ®n³-›‰bœÆTëÂBên?b?ª
+ØSCànİ„¬zÎÀ“.ÿ=òºQ®uDXv”İ2Õ]°m¯«Ä]!ñ!U¼7UïÍüØš·­x[ñîR½»òcXËûdLvŸ,¾ âòÇFª§Tò”LzİX&çGæ ,Q¥e¯ú¶¶å/êà›@OilÅ£ŞRo­£}–ßb B¿¹p½ì*†­¹ô‘.÷)À‚«ôçôóã²oªxGöAz|ù‚‘|1ø‚V¨i•š–©éo|şG£¯|»_úv—®+¾~Õ×_°¯µÂËŠUi=®¶/P¯éö¥{2½âZàğŠwåêjLL(	50Q+»ëˆtåàÑWÁS/ƒ§äw.+ÁI58Y¤–º÷rUS¸ü¼cõ€zâyûeˆŠ{RuOÊîÉZı5Å}]u_—İ×kEW;åí!*îKªû’ì¾ôÚå_Gf{[™ñşjìó1¹ãıç÷@T˜1•“™±2ÓZüåÃ‹…Ñ2ã{]5Œ<ï”ÛF *ÔY•:+Sg×À‚ğáJl5ğâªÒ:­¶Nƒ)nÅêÒqŒüâçåÎË+1 FT˜I•™”™É2ÓñŠÙñ’ÙQê\>¿2ılüùùÕ[2ûÂL¨Ì„¬Ç×UÓ0nç´æŠÊ\‘™+Mdö˜ÂªÌ ÌşÅŠWARè.•î*Ñ/é>™î+÷€éÂÙ­Å½³h_\sï]¶­øŸV¯¾øPş(&»ç÷¼ê‡LÙİ±túg‘*Rú@İ/™n…aU†•öºåü§.`ÔÛu ¸O ş¡ÒÕåkî¾åÑ•kÏï¬Jò•°™“cë 
+çLxFMßêğÏ:4JÊîö¥/˜¢­h{sèÿÒêŞ£X`(TgÁ^\£v”lËş•Àó««Ê×"25£P3*5™2å.~è,PpÆ½Út PĞuhéjéÆÕS]¾¶rç¹ô"$_‡yŞ’ÅœL=P¨*õ 2eÊUxÈlÛkƒ>ñd§LÅ÷Ô€+o7¾½j|“Ã³M¯ÂıÆWÈŸ7]Ö×dªae,Ó&X€P½êW´Q#Â·½®ÿd@F%Hß`ê!@®2m"“8€’.±¦©\kİ¸É¬’³7i²H2k©Ú"Y%â™ùÉùµjJ±Ÿsi_¯Y»!¦:t(H
+—aŠÆ55‰sS ‚fáÎëòf®A‡~Gé•ÂP Ù@ş
+ƒ?`Cw†k66§ß=`“5^Ò`Ó‹0=Ói·\¹…çÖz|3óĞËúé$ `æ²ĞGX<`D…<¢’GdòHÙ¿]n™*pî=ƒ+¯+=SjÏT~tl_²–h`sevïræù\¹ç 6 ö‡°ÿÏà“Ø Œ]…akßİú®neôãˆgô¥ŞØ·7ö<³4ï)h[µ¶ş¬Ö¶ŸÕšúY­í?«µc‹Ög»¾6ÍšètÅÑÍºö»Ô½pæë~œŞª®V´¡”ÌÂ0FÖt»úø‰ŞúÛ<>¢zhY÷Íø«u`ˆÅ¢œ6×
+¹ZSÎÂ9sx¾5ßI­ó5{°[Ä²k%€¿lWœë·„¸«Zü ákîuªæ~ëõ´¶fpš6Qû:¡wÃÎ;Gˆ{~î˜«à<Aûê}Át$g±p\	Íµb‹ø¹š¸hïXz®„ºã™óm\sİ;d{`3FÌA®Á?Ô6m»’Œ_c/aæÁ^2| KÑà^Œ
+1İ“¥¼c8ûi1n"QÈ`…ËÑY®_Ğ‚YËÁƒ `eí‚Ô}¤nœ­ˆÜY”ê!§!ÄV\)YûƒşC‰û‡¢ÉYÍb01¼«AsÖÛŸ Ïh0·~Ãİ˜mo,;p¥¢©ñtìötêvĞ²Ã
+· ±Ã £æ¿fÖyœ§qÌİ)tÑıx*ætePk9-ÌéÎ	]7Ô˜Ç…¡V/Óz#ü,xlO7foPnxñ"‡k¶ª+Ø2röÌ•Ñ¥¬êÀÒ3 yjfXNÍj¬¾ÎÛ5ÇÕ#g?Ÿ½6=J„á‹u\¸tzô¬^&`÷“`Åc™Ó÷Áj‚F{«¡Êj¤>5L÷V}YğYŞÄTO&"±¤ğ	T®à{á8‚iŞÙ¦:wËçeçÅyAu^ÈŸùÿÙş.ÇòI™lWÈ!•’É¡ŸPa[fôÇTò˜L«÷ —/êÙO¨°/Ğ{WÉã2y¼L{^Ñ]/é.…îVéîüÈ7ÎÀÒ»Š³OuöÁœ÷âû2³gi÷WògË-ŞÅ¸Ü²‰û*^;ƒU¡½X©p}îúÚö•S¡ö¨Ô™Ú³Nú,>İKğÊ¿ï¥ßò6ÅLõ+ĞåN¶Ğòšv-‚e±_&Šâ£ÜÓ±ä/u”;?’õ¸ÖÙSŞÙûÏ]+WVGË½‡W»×í¤ó2ñ-h—‰?ëk—‰uÁ4·Ä8$wöÿtdˆÍx†Æì¾ÿKbtSw`òß•w_9 ¢B©ÔL­Qô"Uô<¤éBÓ¯ê+ôa_!¶bşq†<gG°;F-æ?´îEæGÈkTşİK†ÃAòÜ¹s‚NøÈû„_BWáºÅ €s] 4öOÅc3¾Ğ[‘p—Ûñ¿*2b,^!>L¾Ò|oi®ª‹\ÉØ®cØœKAEÎÂ÷—fxÍ£#:dğ*)–gt„n|ĞMÂ%ÜŞ6ü-Ø„k6ğI§âwxêà?šÈ5|éô4äEÍc!‡q}Œ;;N_¹P¡hçÈï]¹tv|Ú p
+úL\2ì#Ø?¦+ì:+ĞéŠ­á°ğ6®ÅF5Ã GL¤¸LœGø5”aScúĞíº™ PDwŞ…eäÈë¿2²çõ_yäj,#:¯ÿÊ¨Cne´]neÔ’×et]ş±XFGäæXFåæX›Òº‰$@ø9€Aù)õ™ëWÑ¿‘âÈRÇãÆ_ùö¿ôíW|TßR}ÃŠûmÕı¶‚Nªè¤ŒN¾vdG@qt©®¼­ìt¦Ší·}¹méZIP<ûUÏş
+çpüäÊK3Š'¨z‚Šs¿êÜŸw”İ­0©ÑÇc_=©ø«¾ÃŠ{@uä¯é2½S¡{Tº'O­“\÷5ĞÑGë!‚"À³Y~ôñ!±n>CXáÚ,yß„ß.\·PHíÍÀ·› j¯‹"™Bö¥¹S6w–I*?òwç>=—×ëfD X?jÿ»‘
+--- Content of ./.git/objects/2e/7c8c81c8545ce984cc7df3c78ac9dec1854fa6 ---
+x+)JMU01f040031Q((ÊON-.ÎMMÉLÔ+¨dh™“ü¿¾ÙŞ+ho`âê‹*Wü´Ìı
+--- Content of ./.git/objects/00/b4510ff3014e8abf647d09582f16b9eae91450 ---
+x­K
+Â0@]çs–ÉÄ!)ˆ®Üºq&S¬$M	ñö‚Ÿ¸{¼Åã…’óÜ€ŒŞ´*."ZŠ‘˜½!r–ï-ºaB§'mQÄ)o×Rá\F©.pôy%%ØÕGøò!¢îk»Ÿè“_ö -“!;8†·ˆ*¼'šü)§NËÜfŸàÓ…2A~ÂZËMBS/d#Kº
+--- Content of ./.git/objects/00/9820abd65ac1b3e0e07b21b70260a4c6a12903 ---
+x+)JMU05e040031QÈMMÉLŒ/-ÉÌ)ÖK.¨,ÉÈÏÓ564Ô+¨Lf¸Ÿ;ÿ$ëÉüTûº[
+"¥{m4  $X
+--- Content of ./.git/objects/84/9e5b6c63ff7f86033f4a52bd5161abd124d44f ---
+xuA
+Â@E]Ï)‚«DW
+ŞÁ©“©IÉÄâİíXk©`v!ïçÿßtÜÀş°[yá¶$yÉ´ŸBìYz”L6’¢CE³T¸æÏÊòT0eO29°´˜Â¬7]ŞvÜ¹&lØ,^4p2Æ‘‡^øB9WEe{Ôk®†ñ,Cj½BH0Ç[¹O]àôS®*ªúı£pË*Õ$›Eğ·xó}>SsîÊ¯ÏchrGx·çº6æ®FŠb
+--- Content of ./.git/objects/cb/98fb01b3564f2be2672d4d717e0e38ea228a5e ---
+x9[lÜVvä3ÃyÊz,K¦ãÇH‘=²c'v'¶4’Wª½#Y’íX^wB9ÒÈ#R!9¶5¹Z£hU#¨`[»Ø5 ô#ëEv,ú€ÑŸz÷£[Ò )ŠıèŸ¶Ù´A¾zîå<8œñ®6£«ÃËË{Şç{y8Ÿ•æÙ·ß8ö&ñÓPÈOÀï/şùÃÅÛ‚ø/tSşQ¥ÎW
+‡Oğd–˜³®äœßSs¾Òs´‹è%wYğ|BÄ§ğoıæ¼¼‡wı99Çğ^†«îİpõóäÑÏü7š–H¹JÓÑÅÿH†¯ş—AüÕ
+-‚Xªô?	ŸÂ¿õ[s©t¹O›eªCĞãÉñc‚w=¦j%$aÁµiÃ¯¢ˆÚ¹kTRÕğªh^Å^æE×óRCÕy¼Ïò8gİ%k84ÖÆ[ @$÷V)V{µöù1ñ˜®Õ„$Äãû	uWã !Z£k87ÖÍ‡¥öèFTï|`¾Cß"o·©«Ä-²@şĞU E’®¹î‚ë&)ï€K¨àıÂ˜WÓµtDI¨ÍUù]˜fs½½®‚»«2qÍS#_cû·`Z­NZ$Qğl¢®ûñm|û'çŸVb}ÍûÊ¹µŞZc^9³Ó1Ó÷Ê™ÇLQÖhÚØß]XÓİØ®ÇîZ*w×>½K|J¾†Î;Nãğ{
+x»sê­çá#ÔÎ*ÎR Üç÷b<¿Ók>ñL]t¿±£èfQ\óûœz¾æÔ³.êıÊ¾è½ßfÛõz×Ph‡k%9m™ì™ğPÁ:Fèø‡qû°Å¿nÁ'·ğ¯«Õ¥F|µòç!!W€|‡¿“|G
+şèfËÂåX‚¬Ãºbë-øWHş¦å­•íê*ŞRS¹¿iË§å1‚(xLÁWğÿüOÀ¾ŸVl¼¨ñUc™;y3ÄvCşK•lÙü?×‚…àRKYW`´–Ÿ/µ•{7p†’»k¤kœN8¥ÿîâÙîà¹w<ßÄ~«>:ÄkïïÀû$Sx÷ì@ò·AØ3]N›á=3x'Xİ3û‡¸¿£Ÿ…_\E!¥*¬*±ûıÕ™‹XS¹yNØœ’Ø”,ğ‚¨f¸¬Â¦eiæ¥$1YÈÉœš‘D6É
+1LƒayAÂ=ÄÀššDs†Ø)N]DœÔE-¯ÆRbº4ÁFa) bgafé†ÍˆÑ¢ˆ,yn-fR˜lZPQP`RIgßÑÇâMjNm²³Ë«Ê‡ÙX	[’ít¤ù% h‘˜æ2Š`C»V,'ÒX eEHeÒ¯J¯°¢¤²i)'òl-é4—É*åü ?Ÿ¬J?Ä«ª°´Á`8YàøŠÅ/¢yW4–p Å¥\–ÇìjÀ€Ğ±çPw9³°¨âYÂíŒ¢"¡æ–K¥EÉÌƒOó¡8v´eëh>­UçğÄ˜C€™¦’Îe³«„nE2`K”œ«±ù×DÆdDBLpÖˆBE‡Ø„éIe3šùˆs¦äûhµ‹Ü €¢ùNeø&x iRöÇW¥²÷÷S‰åßqp	¯œÊB‡Ú×r\9¨£×òÔõhÌ¤%E5}Y)Åeq—Î)‚l2+œ¢Ü’dŞdÊÔòNc_‚‰Ø1Õ M+ò(+¥Áñ{F«Û‰Ëv¨0UblsyÜ¤Zá(ZUsÈŠÕPÍˆª s° o
+lYvô^QcììøÄ{eâÂv|8ñ=v"Á&&G&³cÓÃñÙ‰ËcìXâòÄôdâûc‰Ù™X~ï¢VJNj6aŞtˆ~¼	+ÖË‚ VùÛ„Ê®‚ƒOÆØ1QÉÉ63
+RËrW)Ã€Î\N•–9HÊ9Q‰åGvÂ ÆÆ…Ô21 #ˆ73²$.CÄÆò'2W|#rËÂïóæy°ôì"j-ß,Ê i5g°EÉ	 HÈ°¼ærYµšÔS²°@>V—m¦8Øƒµ!ÕƒÄÖ~P%=T·ÒXvâvˆ~KB~pèÄ²(4áa¾»îI9¼†X“|İ¤’(ä}lß2§Üøşü:„²¹ã§ñRº·’dí.6„CöİhŞ=Ì¢•İtËË	İ¢Ä\Y<ı´Œ#2zó•¡H@Èè+ÿ¶ƒgMŠØ2³ebÄi´X^v :g°ÊtëqÒ—‰°q”ã-8‡+|˜å`Aª°+‚¼î†}ÎrÚûB,l‡<Ëf«6GY^‚ÀAÖÀ;B,f‡Tâœˆ°J‘‚â‹Í…hµÖàx^†İt‘dÕÒ#‘…[\6k++ÀâŠîe§~WW8T6ƒp!Œî<Yia®n^˜Ï-˜4ÚFL&%gÔdX³í€	IÅ›ŞhL¦”ÍÓWÙÏM
+2ˆé½ÅÉ"ìA¦îP2©¬ štFLK¦ŸL_IwI6½¥®é¶»Á½¢dú°—S/˜cÓÉáx|lf&9:–˜MMOON›M0>2<š)´Ä§“ñÉD"9>93kõ‡Ì€¥7>T™Ş’Ø°bıM?R?SLR0Ã*'ƒØÉò4Ÿe_°T£07ı%á!¤L
+$VĞ‹:2U~ßN.JËÂ |+Å-¯ÌÙìà¨,­ÌK·§diˆ28µª.Jâà²Àg8&%y3yA®=áÄVVÍÖÏ¤*%ËËRß ü+ÿ«qøz7Şm„é¡>#Ô·~n‹öÿå…»´æégï °šNÏôŒFÏl»w¸ØŞığÚÇ×6»õö#Fû‘±©k›pù®‘[Á–û“÷&·	¢gØõbÀºÚáo	"4âú†0ı­–ıÚ«Ÿ`5½eÎh™Ó‚s[Lø~ğ^Pk¿ıl	 jÂ/õ¥ êÂMC¸iêÌªÁ¬j¸}³hIÜá*@Tšî5i‘÷Ÿ]€Ú¥ËVGg®ÌU¹ZdBßÀoÛ˜èÊûú4öøƒ+®<¬'ŠŞöG—5ï~h%j z×5×gïYWj)Ñ~ıqWÂõèrÅõ?ÖÔw]Eú£‹}:<ñı = ã ·ÂZdf3ÀjzxÖÏjÌì—»:Ü1vZŸ¨8kşÅ­yŞj:2è”F§¾´İ÷Ş»:ÀS#FàÈúh±<¤X#ÀÂ@SäşÚ½µGszSŸÑÔ·>^7ğe 	YóTÅâ‹^-"¢–\*u"¢ÎH#iŒ„Å~KŸ4Â'5æä—ÖmÂã'zø8†ˆŒQÏxëjAmnÑ~kõ‘AÎQÈ ç(AĞEû€NgïşL‹N¿h`5½sÆèœÙßÿf«)‚"q´C[TNº´ÙK@®gY¹QXNá°œBãĞßjéÖö| ·pF§¹Rx a+>‚f¤{˜²iu–Ò.&9rÉP[í·V©5ŒÕÆjS_{wÀZrq5èQ­8öø“Q­ù¸Õtú„AŸĞè;|*<[Ôç(ÿ4ó4òËëÿx]Ñ ÍÎiÍ‚Õt:mĞiNW(¾ó£5ÃÂGM§Oôi>ıÈ	çïš¿çÂ¾ƒ«u§]ºjuJ·‹+ĞÉ£èqÎºTæZSÀîqdk€0‚ «ÅŞjßı£äí‡_¶.6·£ÖŞmÛGtù-áîğÿÿ×AÂ×t?p/ µMêÌ”ÁLiÌ$ é‚Õ¿ë£3ÖÛ„¥€2(Â½ıØı“&#rÌˆŒ¿Œkq[P\t!ÿOcÿOcÿ—a1´ë£«şdĞØ}ÜØŠk¡x	SÛsC›zAÜô`Öf5ÜjÑÎ½ÓBç¶B­÷“÷P„ô^viÉ”Õ±C"|IÆ+ğ7VVÕöœ– M^0‚´à…ræj]!2•	Hìÿ0<4#Çüñ^êù©}ñ.êó.7ô_Ğ‘ñâE¢‹z=2ÑFı[›úÿ|/ ~h»xŠúõŞxÛÅã”~Ü7&Ç‡T¥ğ¤Ñù4¿:u‡PP+›p[ÿãÉŸ;
+&ktŞ¬|²cÈ‚ŠvTm™JòO—ŠZm€[)ÀÛqk?˜ˆ­0¯aÁµv|Ò :ª2¸qÙÎVş†]|j°•ıàƒ§Qè*||[óÜñğÄL©g+y³ı¤éç3¸˜ÂÉ«?#L
+Õ[.-$?Ì	ò*‹ê?Äö{á’“tn©œ*˜.Ê F©®2İ©¬g4T3İ+2¼—¦·tî3İ˜¨éc%L7& Ÿ@“=px„—¹nt>/Jä#è©¿*’|®£Y¿ °N ó@[±9ò°÷ãŞ''ôêÍGæ£¢•íä¥eŸ¸tfÀ`4f xhàIîïÅMñAÇÃ½ïÕ›_3š_Óš_{zè_ÿeP:o·°açÿ«ğGáp±©}#TŞØñîn-&¤…£›Ã  éLŸÁôiL_±©uC-ÿ•Ò¶»­øbJÜ>6|‚øÕ	ÿH7õ«÷ZF:¨çnè§ìQSù”É@Ì=|eŒ×ÆÊåe[Œ6WøœI6Š•Õ8nÑÚ¨_;‰]XoÄ&Z¯u¿Z¹áÓÃ–Ú±–a]Ğ ±§48©ãõ®Î„õó.¬?b½ÖıœØ5²5ş@G!‹òtÁ>U‚uë>'B©Ö³æ¾ã®®¿ı]v&ùƒh¿—ë(wÇ¬5¨@ÅÕu­ÅjuÑ‹"Ôcnfxxc­ù­"dã2n© jÕdkß±mX{-OÌÕBª
+/ˆ¥aqD­õ>ÄNâJ*—µªÅ$r…B­q)w&[úZ)ÃšŸg/—–…Py±$f])õ"Îp%a¡šk+lÆò‡œäpÅÒšl'boe òmiÈæ]P»ì÷ã”&£¯;ò.ŞDà$ ô&·¼œQåShgIF–²Ùy.uÃD/“’Üï‘ĞÃw8 Î^KYÅJ(î‘aYÖÊ¡’VÖ–Çàñ"ü+>ˆH‘"ù"Ôû2Ô«‡X#Ä®ŸÛvİèèˆ_oÎ<ukíg éÌYƒ9«1gmÙSgÌA9Xl‰<üxPoÙo´ìßğ™–/˜®—L—ÎtL·ÆtWèèLÜ`â/6ulããR%™n„¿ù:@Û·	
+Ê Së~ÉtëLÁôhLO…Zò© µ'Q›~¿ÔùÁu«£3ÌóAùâz8åúÑÍÎÒï0Éß¿5²x¾Ïï£œŠï§>ßï†şç}T|€ø| c”¤úÉD¿+!Âôş€ŒöY³Éñù@î†QåsÓ‹Ê¨„àƒwñVi‚I&Qa'™´‚ ½ğâ}{F~n¿‚;ï[æô²ÄC…ä=ù<Œ¡Šò× ¶)’$‹D«VnE¢C+·"^Ç•Î¶‡ğwot¾İNé¾†ïÀºgÛ?I’`ä:8ïò‘°‡Õ‚.²s›xÿDúÈïÄ
+--- Content of ./.git/objects/e6/9de29bb2d1d6434b8b29ae775ad8c2e48c5391 ---
+xKÊÉOR0`  	°ğ
+--- Content of ./.git/hooks/prepare-commit-msg.sample ---
+#!/bin/sh
+#
+# An example hook script to prepare the commit log message.
+# Called by "git commit" with the name of the file that has the
+# commit message, followed by the description of the commit
+# message's source.  The hook's purpose is to edit the commit
+# message file.  If the hook fails with a non-zero status,
+# the commit is aborted.
+#
+# To enable this hook, rename this file to "prepare-commit-msg".
+
+# This hook includes three examples. The first one removes the
+# "# Please enter the commit message..." help message.
+#
+# The second includes the output of "git diff --name-status -r"
+# into the message, just before the "git status" output.  It is
+# commented because it doesn't cope with --amend or with squashed
+# commits.
+#
+# The third example adds a Signed-off-by line to the message, that can
+# still be edited.  This is rarely a good idea.
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+SHA1=$3
+
+/usr/bin/perl -i.bak -ne 'print unless(m/^. Please enter the commit message/..m/^#$/)' "$COMMIT_MSG_FILE"
+
+# case "$COMMIT_SOURCE,$SHA1" in
+#  ,|template,)
+#    /usr/bin/perl -i.bak -pe '
+#       print "\n" . `git diff --cached --name-status -r`
+# 	 if /^#/ && $first++ == 0' "$COMMIT_MSG_FILE" ;;
+#  *) ;;
+# esac
+
+# SOB=$(git var GIT_COMMITTER_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# git interpret-trailers --in-place --trailer "$SOB" "$COMMIT_MSG_FILE"
+# if test -z "$COMMIT_SOURCE"
+# then
+#   /usr/bin/perl -i.bak -pe 'print "\n" if !$first_line++' "$COMMIT_MSG_FILE"
+# fi
+
+--- Content of ./.git/hooks/pre-applypatch.sample ---
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed
+# by applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-applypatch".
+
+. git-sh-setup
+precommit="$(git rev-parse --git-path hooks/pre-commit)"
+test -x "$precommit" && exec "$precommit" ${1+"$@"}
+:
+
+--- Content of ./.git/hooks/post-update.sample ---
+#!/bin/sh
+#
+# An example hook script to prepare a packed repository for use over
+# dumb transports.
+#
+# To enable this hook, rename this file to "post-update".
+
+exec git update-server-info
+
+--- Content of ./.git/hooks/push-to-checkout.sample ---
+#!/bin/sh
+
+# An example hook script to update a checked-out tree on a git push.
+#
+# This hook is invoked by git-receive-pack(1) when it reacts to git
+# push and updates reference(s) in its repository, and when the push
+# tries to update the branch that is currently checked out and the
+# receive.denyCurrentBranch configuration variable is set to
+# updateInstead.
+#
+# By default, such a push is refused if the working tree and the index
+# of the remote repository has any difference from the currently
+# checked out commit; when both the working tree and the index match
+# the current commit, they are updated to match the newly pushed tip
+# of the branch. This hook is to be used to override the default
+# behaviour; however the code below reimplements the default behaviour
+# as a starting point for convenient modification.
+#
+# The hook receives the commit with which the tip of the current
+# branch is going to be updated:
+commit=$1
+
+# It can exit with a non-zero status to refuse the push (when it does
+# so, it must not modify the index or the working tree).
+die () {
+	echo >&2 "$*"
+	exit 1
+}
+
+# Or it can make any necessary changes to the working tree and to the
+# index to bring them to the desired state when the tip of the current
+# branch is updated to the new commit, and exit with a zero status.
+#
+# For example, the hook can simply run git read-tree -u -m HEAD "$1"
+# in order to emulate git fetch that is run in the reverse direction
+# with git push, as the two-tree form of git read-tree -u -m is
+# essentially the same as git switch or git checkout that switches
+# branches while keeping the local changes in the working tree that do
+# not interfere with the difference between the branches.
+
+# The below is a more-or-less exact translation to shell of the C code
+# for the default behaviour for git's push-to-checkout hook defined in
+# the push_to_deploy() function in builtin/receive-pack.c.
+#
+# Note that the hook will be executed from the repository directory,
+# not from the working tree, so if you want to perform operations on
+# the working tree, you will have to adapt your code accordingly, e.g.
+# by adding "cd .." or using relative paths.
+
+if ! git update-index -q --ignore-submodules --refresh
+then
+	die "Up-to-date check failed"
+fi
+
+if ! git diff-files --quiet --ignore-submodules --
+then
+	die "Working directory has unstaged changes"
+fi
+
+# This is a rough translation of:
+#
+#   head_has_history() ? "HEAD" : EMPTY_TREE_SHA1_HEX
+if git cat-file -e HEAD 2>/dev/null
+then
+	head=HEAD
+else
+	head=$(git hash-object -t tree --stdin </dev/null)
+fi
+
+if ! git diff-index --quiet --cached --ignore-submodules $head --
+then
+	die "Working directory has staged changes"
+fi
+
+if ! git read-tree -u -m "$commit"
+then
+	die "Could not update working tree to new HEAD"
+fi
+
+--- Content of ./.git/hooks/pre-push.sample ---
+#!/bin/sh
+
+# An example hook script to verify what is about to be pushed.  Called by "git
+# push" after it has checked the remote status, but before anything has been
+# pushed.  If this script exits with a non-zero status nothing will be pushed.
+#
+# This hook is called with the following parameters:
+#
+# $1 -- Name of the remote to which the push is being done
+# $2 -- URL to which the push is being done
+#
+# If pushing without using a named remote those arguments will be equal.
+#
+# Information about the commits which are being pushed is supplied as lines to
+# the standard input in the form:
+#
+#   <local ref> <local oid> <remote ref> <remote oid>
+#
+# This sample shows how to prevent push of commits where the log message starts
+# with "WIP" (work in progress).
+
+remote="$1"
+url="$2"
+
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+
+while read local_ref local_oid remote_ref remote_oid
+do
+	if test "$local_oid" = "$zero"
+	then
+		# Handle delete
+		:
+	else
+		if test "$remote_oid" = "$zero"
+		then
+			# New branch, examine all commits
+			range="$local_oid"
+		else
+			# Update to existing branch, examine new commits
+			range="$remote_oid..$local_oid"
+		fi
+
+		# Check for WIP commit
+		commit=$(git rev-list -n 1 --grep '^WIP' "$range")
+		if test -n "$commit"
+		then
+			echo >&2 "Found WIP commit in $local_ref, not pushing"
+			exit 1
+		fi
+	fi
+done
+
+exit 0
+
+--- Content of ./.git/hooks/pre-rebase.sample ---
+#!/bin/sh
+#
+# Copyright (c) 2006, 2008 Junio C Hamano
+#
+# The "pre-rebase" hook is run just before "git rebase" starts doing
+# its job, and can prevent the command from running by exiting with
+# non-zero status.
+#
+# The hook is called with the following parameters:
+#
+# $1 -- the upstream the series was forked from.
+# $2 -- the branch being rebased (or empty when rebasing the current branch).
+#
+# This sample shows how to prevent topic branches that are already
+# merged to 'next' branch from getting rebased, because allowing it
+# would result in rebasing already published history.
+
+publish=next
+basebranch="$1"
+if test "$#" = 2
+then
+	topic="refs/heads/$2"
+else
+	topic=`git symbolic-ref HEAD` ||
+	exit 0 ;# we do not interrupt rebasing detached HEAD
+fi
+
+case "$topic" in
+refs/heads/??/*)
+	;;
+*)
+	exit 0 ;# we do not interrupt others.
+	;;
+esac
+
+# Now we are dealing with a topic branch being rebased
+# on top of master.  Is it OK to rebase it?
+
+# Does the topic really exist?
+git show-ref -q "$topic" || {
+	echo >&2 "No such branch $topic"
+	exit 1
+}
+
+# Is topic fully merged to master?
+not_in_master=`git rev-list --pretty=oneline ^master "$topic"`
+if test -z "$not_in_master"
+then
+	echo >&2 "$topic is fully merged to master; better remove it."
+	exit 1 ;# we could allow it, but there is no point.
+fi
+
+# Is topic ever merged to next?  If so you should not be rebasing it.
+only_next_1=`git rev-list ^master "^$topic" ${publish} | sort`
+only_next_2=`git rev-list ^master           ${publish} | sort`
+if test "$only_next_1" = "$only_next_2"
+then
+	not_in_topic=`git rev-list "^$topic" master`
+	if test -z "$not_in_topic"
+	then
+		echo >&2 "$topic is already up to date with master"
+		exit 1 ;# we could allow it, but there is no point.
+	else
+		exit 0
+	fi
+else
+	not_in_next=`git rev-list --pretty=oneline ^${publish} "$topic"`
+	/usr/bin/perl -e '
+		my $topic = $ARGV[0];
+		my $msg = "* $topic has commits already merged to public branch:\n";
+		my (%not_in_next) = map {
+			/^([0-9a-f]+) /;
+			($1 => 1);
+		} split(/\n/, $ARGV[1]);
+		for my $elem (map {
+				/^([0-9a-f]+) (.*)$/;
+				[$1 => $2];
+			} split(/\n/, $ARGV[2])) {
+			if (!exists $not_in_next{$elem->[0]}) {
+				if ($msg) {
+					print STDERR $msg;
+					undef $msg;
+				}
+				print STDERR " $elem->[1]\n";
+			}
+		}
+	' "$topic" "$not_in_next" "$not_in_master"
+	exit 1
+fi
+
+<<\DOC_END
+
+This sample hook safeguards topic branches that have been
+published from being rewound.
+
+The workflow assumed here is:
+
+ * Once a topic branch forks from "master", "master" is never
+   merged into it again (either directly or indirectly).
+
+ * Once a topic branch is fully cooked and merged into "master",
+   it is deleted.  If you need to build on top of it to correct
+   earlier mistakes, a new topic branch is created by forking at
+   the tip of the "master".  This is not strictly necessary, but
+   it makes it easier to keep your history simple.
+
+ * Whenever you need to test or publish your changes to topic
+   branches, merge them into "next" branch.
+
+The script, being an example, hardcodes the publish branch name
+to be "next", but it is trivial to make it configurable via
+$GIT_DIR/config mechanism.
+
+With this workflow, you would want to know:
+
+(1) ... if a topic branch has ever been merged to "next".  Young
+    topic branches can have stupid mistakes you would rather
+    clean up before publishing, and things that have not been
+    merged into other branches can be easily rebased without
+    affecting other people.  But once it is published, you would
+    not want to rewind it.
+
+(2) ... if a topic branch has been fully merged to "master".
+    Then you can delete it.  More importantly, you should not
+    build on top of it -- other people may already want to
+    change things related to the topic as patches against your
+    "master", so if you need further changes, it is better to
+    fork the topic (perhaps with the same name) afresh from the
+    tip of "master".
+
+Let's look at this example:
+
+		   o---o---o---o---o---o---o---o---o---o "next"
+		  /       /           /           /
+		 /   a---a---b A     /           /
+		/   /               /           /
+	       /   /   c---c---c---c B         /
+	      /   /   /             \         /
+	     /   /   /   b---b C     \       /
+	    /   /   /   /             \     /
+    ---o---o---o---o---o---o---o---o---o---o---o "master"
+
+
+A, B and C are topic branches.
+
+ * A has one fix since it was merged up to "next".
+
+ * B has finished.  It has been fully merged up to "master" and "next",
+   and is ready to be deleted.
+
+ * C has not merged to "next" at all.
+
+We would want to allow C to be rebased, refuse A, and encourage
+B to be deleted.
+
+To compute (1):
+
+	git rev-list ^master ^topic next
+	git rev-list ^master        next
+
+	if these match, topic has not merged in next at all.
+
+To compute (2):
+
+	git rev-list master..topic
+
+	if this is empty, it is fully merged to "master".
+
+DOC_END
+
+--- Content of ./.git/hooks/update.sample ---
+#!/bin/sh
+#
+# An example hook script to block unannotated tags from entering.
+# Called by "git receive-pack" with arguments: refname sha1-old sha1-new
+#
+# To enable this hook, rename this file to "update".
+#
+# Config
+# ------
+# hooks.allowunannotated
+#   This boolean sets whether unannotated tags will be allowed into the
+#   repository.  By default they won't be.
+# hooks.allowdeletetag
+#   This boolean sets whether deleting tags will be allowed in the
+#   repository.  By default they won't be.
+# hooks.allowmodifytag
+#   This boolean sets whether a tag may be modified after creation. By default
+#   it won't be.
+# hooks.allowdeletebranch
+#   This boolean sets whether deleting branches will be allowed in the
+#   repository.  By default they won't be.
+# hooks.denycreatebranch
+#   This boolean sets whether remotely creating branches will be denied
+#   in the repository.  By default this is allowed.
+#
+
+# --- Command line
+refname="$1"
+oldrev="$2"
+newrev="$3"
+
+# --- Safety check
+if [ -z "$GIT_DIR" ]; then
+	echo "Don't run this script from the command line." >&2
+	echo " (if you want, you could supply GIT_DIR then run" >&2
+	echo "  $0 <ref> <oldrev> <newrev>)" >&2
+	exit 1
+fi
+
+if [ -z "$refname" -o -z "$oldrev" -o -z "$newrev" ]; then
+	echo "usage: $0 <ref> <oldrev> <newrev>" >&2
+	exit 1
+fi
+
+# --- Config
+allowunannotated=$(git config --type=bool hooks.allowunannotated)
+allowdeletebranch=$(git config --type=bool hooks.allowdeletebranch)
+denycreatebranch=$(git config --type=bool hooks.denycreatebranch)
+allowdeletetag=$(git config --type=bool hooks.allowdeletetag)
+allowmodifytag=$(git config --type=bool hooks.allowmodifytag)
+
+# check for no description
+projectdesc=$(sed -e '1q' "$GIT_DIR/description")
+case "$projectdesc" in
+"Unnamed repository"* | "")
+	echo "*** Project description file hasn't been set" >&2
+	exit 1
+	;;
+esac
+
+# --- Check types
+# if $newrev is 0000...0000, it's a commit to delete a ref.
+zero=$(git hash-object --stdin </dev/null | tr '[0-9a-f]' '0')
+if [ "$newrev" = "$zero" ]; then
+	newrev_type=delete
+else
+	newrev_type=$(git cat-file -t $newrev)
+fi
+
+case "$refname","$newrev_type" in
+	refs/tags/*,commit)
+		# un-annotated tag
+		short_refname=${refname##refs/tags/}
+		if [ "$allowunannotated" != "true" ]; then
+			echo "*** The un-annotated tag, $short_refname, is not allowed in this repository" >&2
+			echo "*** Use 'git tag [ -a | -s ]' for tags you want to propagate." >&2
+			exit 1
+		fi
+		;;
+	refs/tags/*,delete)
+		# delete tag
+		if [ "$allowdeletetag" != "true" ]; then
+			echo "*** Deleting a tag is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/tags/*,tag)
+		# annotated tag
+		if [ "$allowmodifytag" != "true" ] && git rev-parse $refname > /dev/null 2>&1
+		then
+			echo "*** Tag '$refname' already exists." >&2
+			echo "*** Modifying a tag is not allowed in this repository." >&2
+			exit 1
+		fi
+		;;
+	refs/heads/*,commit)
+		# branch
+		if [ "$oldrev" = "$zero" -a "$denycreatebranch" = "true" ]; then
+			echo "*** Creating a branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/heads/*,delete)
+		# delete branch
+		if [ "$allowdeletebranch" != "true" ]; then
+			echo "*** Deleting a branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	refs/remotes/*,commit)
+		# tracking branch
+		;;
+	refs/remotes/*,delete)
+		# delete tracking branch
+		if [ "$allowdeletebranch" != "true" ]; then
+			echo "*** Deleting a tracking branch is not allowed in this repository" >&2
+			exit 1
+		fi
+		;;
+	*)
+		# Anything else (is there anything else?)
+		echo "*** Update hook: unknown type of update to ref $refname of type $newrev_type" >&2
+		exit 1
+		;;
+esac
+
+# --- Finished
+exit 0
+
+--- Content of ./.git/hooks/pre-receive.sample ---
+#!/bin/sh
+#
+# An example hook script to make use of push options.
+# The example simply echoes all push options that start with 'echoback='
+# and rejects all pushes when the "reject" push option is used.
+#
+# To enable this hook, rename this file to "pre-receive".
+
+if test -n "$GIT_PUSH_OPTION_COUNT"
+then
+	i=0
+	while test "$i" -lt "$GIT_PUSH_OPTION_COUNT"
+	do
+		eval "value=\$GIT_PUSH_OPTION_$i"
+		case "$value" in
+		echoback=*)
+			echo "echo from the pre-receive-hook: ${value#*=}" >&2
+			;;
+		reject)
+			exit 1
+		esac
+		i=$((i + 1))
+	done
+fi
+
+--- Content of ./.git/hooks/pre-merge-commit.sample ---
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git merge" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message to
+# stderr if it wants to stop the merge commit.
+#
+# To enable this hook, rename this file to "pre-merge-commit".
+
+. git-sh-setup
+test -x "$GIT_DIR/hooks/pre-commit" &&
+        exec "$GIT_DIR/hooks/pre-commit"
+:
+
+--- Content of ./.git/hooks/pre-commit.sample ---
+#!/bin/sh
+#
+# An example hook script to verify what is about to be committed.
+# Called by "git commit" with no arguments.  The hook should
+# exit with non-zero status after issuing an appropriate message if
+# it wants to stop the commit.
+#
+# To enable this hook, rename this file to "pre-commit".
+
+if git rev-parse --verify HEAD >/dev/null 2>&1
+then
+	against=HEAD
+else
+	# Initial commit: diff against an empty tree object
+	against=$(git hash-object -t tree /dev/null)
+fi
+
+# If you want to allow non-ASCII filenames set this variable to true.
+allownonascii=$(git config --type=bool hooks.allownonascii)
+
+# Redirect output to stderr.
+exec 1>&2
+
+# Cross platform projects tend to avoid non-ASCII filenames; prevent
+# them from being added to the repository. We exploit the fact that the
+# printable range starts at the space character and ends with tilde.
+if [ "$allownonascii" != "true" ] &&
+	# Note that the use of brackets around a tr range is ok here, (it's
+	# even required, for portability to Solaris 10's /usr/bin/tr), since
+	# the square bracket bytes happen to fall in the designated range.
+	test $(git diff --cached --name-only --diff-filter=A -z $against |
+	  LC_ALL=C tr -d '[ -~]\0' | wc -c) != 0
+then
+	cat <<\EOF
+Error: Attempt to add a non-ASCII file name.
+
+This can cause problems if you want to work with people on other platforms.
+
+To be portable it is advisable to rename the file.
+
+If you know what you are doing you can disable this check using:
+
+  git config hooks.allownonascii true
+EOF
+	exit 1
+fi
+
+# If there are whitespace errors, print the offending file names and fail.
+exec git diff-index --check --cached $against --
+
+--- Content of ./.git/hooks/commit-msg.sample ---
+#!/bin/sh
+#
+# An example hook script to check the commit log message.
+# Called by "git commit" with one argument, the name of the file
+# that has the commit message.  The hook should exit with non-zero
+# status after issuing an appropriate message if it wants to stop the
+# commit.  The hook is allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "commit-msg".
+
+# Uncomment the below to add a Signed-off-by line to the message.
+# Doing this in a hook is a bad idea in general, but the prepare-commit-msg
+# hook is more suited to it.
+#
+# SOB=$(git var GIT_AUTHOR_IDENT | sed -n 's/^\(.*>\).*$/Signed-off-by: \1/p')
+# grep -qs "^$SOB" "$1" || echo "$SOB" >> "$1"
+
+# This example catches duplicate Signed-off-by lines.
+
+test "" = "$(grep '^Signed-off-by: ' "$1" |
+	 sort | uniq -c | sed -e '/^[ 	]*1[ 	]/d')" || {
+	echo >&2 Duplicate Signed-off-by lines.
+	exit 1
+}
+
+--- Content of ./.git/hooks/applypatch-msg.sample ---
+#!/bin/sh
+#
+# An example hook script to check the commit log message taken by
+# applypatch from an e-mail message.
+#
+# The hook should exit with non-zero status after issuing an
+# appropriate message if it wants to stop the commit.  The hook is
+# allowed to edit the commit message file.
+#
+# To enable this hook, rename this file to "applypatch-msg".
+
+. git-sh-setup
+commitmsg="$(git rev-parse --git-path hooks/commit-msg)"
+test -x "$commitmsg" && exec "$commitmsg" ${1+"$@"}
+:
+
+--- Content of ./.git/hooks/fsmonitor-watchman.sample ---
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use IPC::Open2;
+
+# An example hook script to integrate Watchman
+# (https://facebook.github.io/watchman/) with git to speed up detecting
+# new and modified files.
+#
+# The hook is passed a version (currently 2) and last update token
+# formatted as a string and outputs to stdout a new update token and
+# all files that have been modified since the update token. Paths must
+# be relative to the root of the working tree and separated by a single NUL.
+#
+# To enable this hook, rename this file to "query-watchman" and set
+# 'git config core.fsmonitor .git/hooks/query-watchman'
+#
+my ($version, $last_update_token) = @ARGV;
+
+# Uncomment for debugging
+# print STDERR "$0 $version $last_update_token\n";
+
+# Check the hook interface version
+if ($version ne 2) {
+	die "Unsupported query-fsmonitor hook version '$version'.\n" .
+	    "Falling back to scanning...\n";
+}
+
+my $git_work_tree = get_working_dir();
+
+my $retry = 1;
+
+my $json_pkg;
+eval {
+	require JSON::XS;
+	$json_pkg = "JSON::XS";
+	1;
+} or do {
+	require JSON::PP;
+	$json_pkg = "JSON::PP";
+};
+
+launch_watchman();
+
+sub launch_watchman {
+	my $o = watchman_query();
+	if (is_work_tree_watched($o)) {
+		output_result($o->{clock}, @{$o->{files}});
+	}
+}
+
+sub output_result {
+	my ($clockid, @files) = @_;
+
+	# Uncomment for debugging watchman output
+	# open (my $fh, ">", ".git/watchman-output.out");
+	# binmode $fh, ":utf8";
+	# print $fh "$clockid\n@files\n";
+	# close $fh;
+
+	binmode STDOUT, ":utf8";
+	print $clockid;
+	print "\0";
+	local $, = "\0";
+	print @files;
+}
+
+sub watchman_clock {
+	my $response = qx/watchman clock "$git_work_tree"/;
+	die "Failed to get clock id on '$git_work_tree'.\n" .
+		"Falling back to scanning...\n" if $? != 0;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub watchman_query {
+	my $pid = open2(\*CHLD_OUT, \*CHLD_IN, 'watchman -j --no-pretty')
+	or die "open2() failed: $!\n" .
+	"Falling back to scanning...\n";
+
+	# In the query expression below we're asking for names of files that
+	# changed since $last_update_token but not from the .git folder.
+	#
+	# To accomplish this, we're using the "since" generator to use the
+	# recency index to select candidate nodes and "fields" to limit the
+	# output to file names only. Then we're using the "expression" term to
+	# further constrain the results.
+	my $last_update_line = "";
+	if (substr($last_update_token, 0, 1) eq "c") {
+		$last_update_token = "\"$last_update_token\"";
+		$last_update_line = qq[\n"since": $last_update_token,];
+	}
+	my $query = <<"	END";
+		["query", "$git_work_tree", {$last_update_line
+			"fields": ["name"],
+			"expression": ["not", ["dirname", ".git"]]
+		}]
+	END
+
+	# Uncomment for debugging the watchman query
+	# open (my $fh, ">", ".git/watchman-query.json");
+	# print $fh $query;
+	# close $fh;
+
+	print CHLD_IN $query;
+	close CHLD_IN;
+	my $response = do {local $/; <CHLD_OUT>};
+
+	# Uncomment for debugging the watch response
+	# open ($fh, ">", ".git/watchman-response.json");
+	# print $fh $response;
+	# close $fh;
+
+	die "Watchman: command returned no output.\n" .
+	"Falling back to scanning...\n" if $response eq "";
+	die "Watchman: command returned invalid output: $response\n" .
+	"Falling back to scanning...\n" unless $response =~ /^\{/;
+
+	return $json_pkg->new->utf8->decode($response);
+}
+
+sub is_work_tree_watched {
+	my ($output) = @_;
+	my $error = $output->{error};
+	if ($retry > 0 and $error and $error =~ m/unable to resolve root .* directory (.*) is not watched/) {
+		$retry--;
+		my $response = qx/watchman watch "$git_work_tree"/;
+		die "Failed to make watchman watch '$git_work_tree'.\n" .
+		    "Falling back to scanning...\n" if $? != 0;
+		$output = $json_pkg->new->utf8->decode($response);
+		$error = $output->{error};
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		# Uncomment for debugging watchman output
+		# open (my $fh, ">", ".git/watchman-output.out");
+		# close $fh;
+
+		# Watchman will always return all files on the first query so
+		# return the fast "everything is dirty" flag to git and do the
+		# Watchman query just to get it over with now so we won't pay
+		# the cost in git to look up each individual file.
+		my $o = watchman_clock();
+		$error = $output->{error};
+
+		die "Watchman: $error.\n" .
+		"Falling back to scanning...\n" if $error;
+
+		output_result($o->{clock}, ("/"));
+		$last_update_token = $o->{clock};
+
+		eval { launch_watchman() };
+		return 0;
+	}
+
+	die "Watchman: $error.\n" .
+	"Falling back to scanning...\n" if $error;
+
+	return 1;
+}
+
+sub get_working_dir {
+	my $working_dir;
+	if ($^O =~ 'msys' || $^O =~ 'cygwin') {
+		$working_dir = Win32::GetCwd();
+		$working_dir =~ tr/\\/\//;
+	} else {
+		require Cwd;
+		$working_dir = Cwd::cwd();
+	}
+
+	return $working_dir;
+}
+
+--- Content of ./.git/HEAD ---
+ref: refs/heads/main
+
+--- Content of ./.git/logs/refs/heads/main ---
+0000000000000000000000000000000000000000 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752327985 -0400	commit (initial): Initial commit of my project
+00b4510ff3014e8abf647d09582f16b9eae91450 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328111 -0400	Branch: renamed refs/heads/master to refs/heads/main
+00b4510ff3014e8abf647d09582f16b9eae91450 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328637 -0400	Branch: renamed refs/heads/main to refs/heads/main
+00b4510ff3014e8abf647d09582f16b9eae91450 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328747 -0400	Branch: renamed refs/heads/main to refs/heads/main
+
+--- Content of ./.git/logs/refs/remotes/origin/main ---
+0000000000000000000000000000000000000000 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328753 -0400	update by push
+
+--- Content of ./.git/logs/HEAD ---
+0000000000000000000000000000000000000000 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752327985 -0400	commit (initial): Initial commit of my project
+00b4510ff3014e8abf647d09582f16b9eae91450 0000000000000000000000000000000000000000 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328111 -0400	Branch: renamed refs/heads/master to refs/heads/main
+0000000000000000000000000000000000000000 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328111 -0400	Branch: renamed refs/heads/master to refs/heads/main
+00b4510ff3014e8abf647d09582f16b9eae91450 0000000000000000000000000000000000000000 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328637 -0400	Branch: renamed refs/heads/main to refs/heads/main
+00b4510ff3014e8abf647d09582f16b9eae91450 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328637 -0400	Branch: renamed refs/heads/main to refs/heads/main
+00b4510ff3014e8abf647d09582f16b9eae91450 0000000000000000000000000000000000000000 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328747 -0400	Branch: renamed refs/heads/main to refs/heads/main
+00b4510ff3014e8abf647d09582f16b9eae91450 00b4510ff3014e8abf647d09582f16b9eae91450 Robert W Campbell <rwcampbell@d01.rob-campbell.lan> 1752328747 -0400	Branch: renamed refs/heads/main to refs/heads/main
+
+--- Content of ./config/media_types.json ---
+{
+  "Images": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".raw", ".cr2", ".nef", ".orf", ".sr2", ".arw", ".dng", ".rw2", ".pef"],
+  "Videos": [".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv", ".webm", ".mpeg", ".mpg", ".3gp", ".m4v", ".mts", ".m2ts", ".ts", ".vob", ".divx", ".xvid"],
+  "Audio": [".mp3", ".aac", ".wav", ".flac", ".ogg", ".wma", ".m4a", ".aiff", ".alac"],
+  "Documents": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf"]
+}
+
+
+--- Content of ./config/metadata_mappings.json ---
+{
+  "Videos": {
+	"FileName": "file_name",
+	"Directory": "file_location",
+    "CreateDate": "date_taken",
+    "ImageSize": "resolution",
+    "FileSize": "size",
+    "Make": "camera_make",
+    "Model": "camera_model",
+    "Duration": "duration",
+    "FrameRate": "frame_rate",
+    "VideoFrameRate": "frame_rate",
+    "LightMeter": "light_meter",
+    "LensID": "lens_id",
+    "LensSpec": "lens_spec",
+    "CircleOfConfusion": "circle_of_confusion",
+    "Altitude": "altitude",
+    "ShutterSpeed": "shutter_speed",
+    "Aperture": "aperture",
+    "ISO": "iso",
+    "Flash": "flash"
+  }
+}
+
+
 --- Content of ./db_connection.py ---
 import configparser
 import mysql.connector
@@ -129,6 +1671,17 @@ def execute_query(connection, query, params=None):
     finally:
         cursor.close()
 
+def is_processed(db_conn, file_path):
+    try:
+        query = "SELECT COUNT(*) FROM {media_type} WHERE file_path = %s"
+        cursor.execute(query, (os.path.basename(file_path),))
+        with db_conn.cursor(buffered=True) as cursor:
+            cursor.execute(query, (file_path,))
+            count = cursor.fetchone()[0]
+            return count > 0
+    except Exception as e:
+        print(f"[DB] Failed is_processed check for {file_path}: {e}")
+        return False
 
 
 --- Content of ./processors/processmedia.py ---
@@ -145,127 +1698,395 @@ def process(file_paths):
         log_action(f"Processed: {path}")
 
 
---- Content of ./utils/media_utils.py ---
-# utils/media_utils.py
+--- Content of ./managers/db_manager.py ---
+from db_connection import execute_query
 
+def get_media_id_by_filename(db_conn, filename, media_type, logger):
+    table = "Photos" if media_type == "Photos" else "Videos"
+    query = f"SELECT id FROM {table} WHERE file_name = %s"
+    logger.debug(f"Querying {table} for filename: {filename}")
+    result = execute_query(db_conn, query, (filename,))
+    return result[0][0] if result else None
+
+def update_media_date_taken(db_conn, media_id, new_datetime, media_type, logger):
+    table = "Photos" if media_type == "Photos" else "Videos"
+    query = f"UPDATE {table} SET date_taken = %s WHERE id = %s"
+    logger.debug(f"Executing SQL: {query} with params=({new_datetime}, {media_id})")
+    try:
+        execute_query(db_conn, query, (new_datetime, media_id))
+        logger.info(f"Updated {media_type} ID {media_id} with date_taken={new_datetime}")
+    except Exception as e:
+        logger.error(f"Update failed for {media_type} ID {media_id}: {e}")
+
+
+--- Content of ./managers/media_transfer.py ---
 import os
-import re
+import shutil
+import logging
+from pathlib import Path
+
+def transfer_files(sources, target, dry_run=False, remove_sources=False):
+    target = Path(target).expanduser()
+    os.makedirs(target, exist_ok=True)
+
+    for source in sources:
+        source_path = Path(source).expanduser()
+        if not source_path.exists():
+            logging.warning(f"Source path {source_path} does not exist.")
+            continue
+
+        for root, _, files in os.walk(source_path):
+            for name in files:
+                src = Path(root) / name
+                dst = target / name
+
+                prefix = "DRY_RUN: " if dry_run else ""
+                logging.info(f"{prefix}Transfer {src} -> {dst}")
+
+                if not dry_run:
+                    shutil.copy2(src, dst)
+                    if remove_sources:
+                        try:
+                            os.remove(src)
+                            logging.info(f"Removed source file: {src}")
+                        except Exception as e:
+                            logging.error(f"Failed to remove source file {src}: {e}")
+                elif remove_sources:
+                    logging.info(f"DRY_RUN: Would remove {src}")
+
+
+
+--- Content of ./managers/__init__.py ---
+
+--- Content of ./managers/media_manager.py ---
+# managers/media_manager.py
+
+import argparse
+import sys
+import os
+import subprocess
+import json
+from pathlib import Path
 from datetime import datetime
-from db_connection import safe_query as execute_query
-from app_utils import load_metadata_mappings
+import logging
+from app_utils import setup_logging, app_failed, load_media_types, load_metadata_mappings
+from metadata_parser import select_oldest_datetime
+from db_connection import connect_to_database
+import re
+from utils.media_utils import (
+    get_existing_media_record,
+    insert_new_media_record,
+    update_missing_media_fields
+)
+from utils.file_mover import move_file
+from utils.file_mover import process_sources
+
+if media_type == "Videos":
+    if is_tiktok(file_path):
+        move_file(file_path, local_tiktok_dir, dry_run)
+        move_file(file_path, remote_tiktok_dir, dry_run)
+    elif "Novatek" in file_path:
+        move_file(file_path, local_dashcam_dir, dry_run)
+        move_file(file_path, remote_dashcam_dir, dry_run)
+    else:
+        move_file(file_path, local_videos_dir, dry_run)
+        move_file(file_path, remote_videos_dir, dry_run)
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+EXT_MAP = load_media_types()
+IMAGE_EXTS = set(EXT_MAP.get("Photos", []))
+VIDEO_EXTS = set(EXT_MAP.get("Videos", []))
+AUDIO_EXTS = set(EXT_MAP.get("Audio", []))
+DOCUMENT_EXTS = set(EXT_MAP.get("Documents", []))
 
 MAPPINGS = load_metadata_mappings()
 
-def get_existing_media_record(db_conn, file_name, media_type, logger):
+USER_HOME = Path.home()
+LOCAL_MEDIA_ROOT = USER_HOME / "Videos"
+REMOTE_MEDIA_ROOT = "/multimedia"
+
+local_photos_dir = USER_HOME / "Pictures"
+local_videos_dir = LOCAL_MEDIA_ROOT
+local_dashcam_dir = LOCAL_MEDIA_ROOT / "DC"
+local_tiktok_dir = LOCAL_MEDIA_ROOT / "TikTok"
+
+remote_photos_dir = Path(REMOTE_MEDIA_ROOT) / "photos"
+remote_videos_dir = Path(REMOTE_MEDIA_ROOT) / "videos"
+remote_dashcam_dir = remote_videos_dir / "DC"
+remote_tiktok_dir = remote_videos_dir / "TikTok"
+
+def get_exiftool_data(file_path, logger):
+    command = ["exiftool", "-j", file_path]
+    logger.debug(f"Running command: {' '.join(command)}")
     try:
-        logger.debug("Using context-managed cursor to fetch existing record")
-        query = f"SELECT * FROM {media_type} WHERE file_name = %s"
-        with db_conn.cursor(buffered=True) as cursor:
-            cursor.execute(query, (file_name,))
-            row = cursor.fetchone()
-            if not row:
-                return None
-            column_names = [desc[0] for desc in cursor.description]  # â† MOVE THIS HERE
-            return dict(zip(column_names, row))                      # â† AND THIS
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        metadata = json.loads(result.stdout)[0]
+        logger.debug(f"Raw ExifTool metadata: {metadata}")
+        return metadata
     except Exception as e:
-        logger.error(f"Failed to fetch record for {file_name}: {e}")
-        return None
+        logger.warning(f"ExifTool failed for {file_path}: {e}")
+        return {}
 
-def sanitize_metadata(raw_metadata, mapping, file_path=None):
-    clean = {}
-
-    for exif_key, db_field in mapping.items():
-        value = raw_metadata.get(exif_key)
-        if value in ("", None, "0000:00:00 00:00:00", "N/A"):
-            continue
-
-        logger.debug(f"Raw metadata received: {raw_metadata}")
-        logger.debug(f"Mapped fields: {mapping}")
-
-        try:
-            if db_field == "date_taken":
-                value = datetime.strptime(str(value)[:19].replace(":", "-", 2), "%Y-%m-%d %H:%M:%S")
-            elif db_field == "flash":
-                value = 1 if str(value).lower().strip() in {"yes", "true", "1"} else 0
-            elif db_field == "duration":
-                match = re.search(r"(\d+):(\d+):(\d+)", str(value))
-                if match:
-                    h, m, s = map(int, match.groups())
-                    value = h * 3600 + m * 60 + s
-                else:
-                    match = re.search(r"(\d+):(\d+)", str(value))
-                    if match:
-                        m, s = map(int, match.groups())
-                        value = m * 60 + s
-        except Exception:
-            continue
-
-        clean[db_field] = value
-
-    # Ensure required fields
-    if "file_name" not in clean:
-        clean["file_name"] = raw_metadata.get("FileName") or os.path.basename(file_path or "")
-    if "file_location" not in clean:
-        clean["file_location"] = raw_metadata.get("Directory") or os.path.dirname(file_path or "")
-
-    return clean
-
-def insert_new_media_record(db_conn, metadata, media_type, logger, dry_run=False, file_path=None):
-    mapping = MAPPINGS.get(media_type, {})
-    sanitized = sanitize_metadata(metadata, mapping, file_path=file_path)
-    logger.debug(f"Sanitized fields for {media_type}: {sanitized}")
-
-    if not sanitized:
-        logger.debug(f"No insertable metadata for {media_type}")
+"""
+def update_media_record(db_conn, media_id, metadata, media_type, logger, dry_run=False):
+    if not metadata:
+        logger.debug(f"No metadata to update for {media_id}")
         return
 
-    columns = list(sanitized.keys())
-    values = list(sanitized.values())
-    placeholders = ', '.join(['%s'] * len(values))
-    sql = f"INSERT INTO {media_type} ({', '.join(columns)}) VALUES ({placeholders})"
+    # Determine valid fields (assume DB columns match ExifTool keys in snake_case)
+    columns = []
+    values = []
 
-    logger.debug(f"SQL INSERT: {sql}")
-    logger.debug(f"Values: {values}")
-    if dry_run:
-        logger.info(f"DRY_RUN: Would insert new {media_type} record for {sanitized.get('file_name')}")
-    else:
-        try:
-            with db_conn.cursor() as cursor:
-                cursor.execute(sql, tuple(values))
-                db_conn.commit()
-                logger.info(f"Inserted new {media_type} record: {sanitized.get('file_name')}")
-        except Exception as e:
-            logger.error(f"Insert failed for {media_type}: {e}")
+    for key, value in metadata.items():
+        # Skip complex/nested fields or nulls
+        if isinstance(value, (list, dict)) or value in ("", None):
+            continue
 
-def update_missing_media_fields(db_conn, media_id, metadata, existing_row, media_type, logger, dry_run=False, file_path=None):
-    mapping = MAPPINGS.get(media_type, {})
-    sanitized = sanitize_metadata(metadata, mapping, file_path=file_path)
-    updates = {}
+        # Convert ExifTool keys like "CreateDate" to "create_date"
+        column_name = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
 
-    for field, value in sanitized.items():
-        if field not in existing_row or existing_row[field] in (None, '', 0):
-            updates[field] = value
+        if column_name == "source_file":
+            continue  # skip filename
 
-    if not updates:
-        logger.debug(f"No new fields to update for ID {media_id}")
+        columns.append(column_name)
+        values.append(value)
+
+    if not columns:
+        logger.debug(f"No updatable metadata fields found for ID {media_id}")
         return
 
-    sql_parts = [f"`{field}` = %s" for field in updates]
-    values = list(updates.values()) + [media_id]
-    sql = f"UPDATE {media_type} SET {', '.join(sql_parts)} WHERE id = %s"
+    set_clause = ", ".join([f"{col} = %s" for col in columns])
+    query = f"UPDATE {media_type} SET {set_clause} WHERE id = %s"
+    values.append(media_id)
 
-    logger.debug(f"SQL UPDATE: {sql}")
+    logger.debug(f"SQL UPDATE: {query}")
     logger.debug(f"Values: {values}")
+
     if dry_run:
-        logger.info(f"DRY_RUN: Would update {media_type} ID {media_id} with {len(updates)} fields")
+        logger.info(f"DRY_RUN: Would update {media_type} ID {media_id} with metadata")
     else:
         try:
-            with db_conn.cursor() as cursor:
-                cursor.execute(sql, tuple(values))
-                db_conn.commit()
-                logger.info(f"Updated {media_type} ID {media_id} with {len(updates)} fields")
+            execute_query(db_conn, query, tuple(values))
+            logger.info(f"Updated {media_type} ID {media_id} with {len(columns)} metadata fields")
         except Exception as e:
-            logger.error(f"Update failed for ID {media_id}: {e}")
+            logger.error(f"Failed to update ID {media_id}: {e}")
+"""
+
+def list_valid_files(root_dir, extensions, logger):
+    for root, _, files in os.walk(root_dir):
+        logger.debug(f"Scanning: {root}")
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in extensions:
+                yield os.path.join(root, file)
+            else:
+                logger.debug(f"Skipping unsupported: {file}")
+
+def process_media_files(logger, source_dirs, valid_exts, db_conn,
+                        dry_run=False, debug=False, verbose=False, media_type="Videos"):
+
+    if dry_run:
+        debug = verbose = True
+
+    media_files = [fp for d in source_dirs for fp in list_valid_files(d, valid_exts, logger)]
+    total_files = len(media_files)
+    logger.info(f"[{media_type}] Total files: {total_files}")
+
+    updated = skipped = inserted = unmatched = 0
+    batch_limit = 10
+    insert_batch = []
+    update_batch = []
+
+    for idx, file_path in enumerate(media_files, 1):
+        if is_processed(db_conn, file_path):
+            logger.debug(f"{file_path} already processed. Skipping.")
+            skipped += 1
+            continue
+
+        prefix = f"[{media_type}] [{idx}/{total_files}]"
+        logger.info(f"{prefix} Processing: {file_path}" if verbose else f"{prefix}")
+
+        file_name = os.path.basename(file_path)
+        metadata = get_exiftool_data(file_path, logger)
+
+        if "CreateDate" not in metadata:
+            fallback_dt = select_oldest_datetime({}, logger, filename=file_name)
+            if fallback_dt:
+                metadata["CreateDate"] = fallback_dt.strftime("%Y:%m:%d %H:%M:%S")
+                logger.debug(f"Using fallback datetime: {metadata['CreateDate']}")
+                logger.debug("Running fallback datetime parser, not using execute_query")
+                logger.debug(f"select_oldest_datetime received: {file_name}")
+
+        if not db_conn:
+            logger.info(f"DRY_RUN: Would process metadata for {file_name}")
+            skipped += 1
+            continue
+
+        logger.debug(f"Checking DB for existing record: {file_name}")
+        existing = get_existing_media_record(db_conn, file_name, media_type, logger)
+        if existing:
+            logger.debug(f"Found existing record for {file_name}, queuing update")
+            update_batch.append((file_path, existing["id"], metadata, existing))
+        else:
+            logger.debug(f"No existing record found for {file_name}, queuing insert")
+            insert_batch.append((file_path, metadata))
+
+        # Batch flush
+        if len(insert_batch) >= batch_limit:
+            for file_path, record in insert_batch:
+                insert_new_media_record(db_conn, record, media_type, logger, dry_run, file_path=file_path)
+                inserted += 1
+            insert_batch.clear()
+
+        if len(update_batch) >= batch_limit:
+            for file_path, media_id, record, existing_row in update_batch:
+                update_missing_media_fields(db_conn, media_id, record, existing_row, media_type, logger, dry_run, file_path=file_path)
+                updated += 1
+            update_batch.clear()
+
+    # Final flush
+    for file_path, record in insert_batch:
+        insert_new_media_record(db_conn, record, media_type, logger, dry_run, file_path=file_path)
+        inserted += 1
+
+    for file_path, media_id, record, existing_row in update_batch:
+        update_missing_media_fields(db_conn, media_id, record, existing_row, media_type, logger, dry_run, file_path=file_path)
+        updated += 1
+
+    logger.info(f"[{media_type}] Summary: scanned={total_files}, inserted={inserted}, updated={updated}, skipped={skipped}, unmatched={unmatched}")
+
+def handle_media(logger, media_type, source_dirs, ext_set,
+                 dry_run=False, debug=False, verbose=False,
+                 config_file=None, config_section=None):
+
+    logger.info(f"Handling {media_type} files...")
+    db_conn = None if dry_run else connect_to_database(config_file, config_section)
+    process_media_files(logger, source_dirs, ext_set, db_conn,
+                        dry_run=dry_run, debug=debug, verbose=verbose,
+                        media_type=media_type)
+
+def main():
+    parser = argparse.ArgumentParser(description="Unified Media Manager")
+    parser.add_argument("--videos", action="store_true", help="Process video files")
+    parser.add_argument("--photos", action="store_true", help="Process photo files")
+    parser.add_argument("--all", action="store_true", help="Process all media types")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate actions without writing to DB or moving files")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--move-only", action="store_true", help="Only move files, skip database ingest entirely")
+    parser.add_argument("--sources", nargs="+", help="Specify one or more source directories to move files from")
+    parser.add_argument("--target", choices=["local", "remote", "both"], default="local", help="Where to move files")
+    args = parser.parse_args()
+
+    # Initialize logging
+    logger = setup_logging("media_manager")
+    debug = args.debug or args.dry_run
+    verbose = args.verbose or args.dry_run
+    if debug:
+        logger.setLevel(logging.DEBUG)
+
+    config_file = os.path.expanduser("~/.my.cnf")
+    config_section = "media"
+    db_conn = None if args.dry_run else connect_to_database(config_file, config_section)
+
+    # MOVE-ONLY mode
+    if args.move_only:
+        print("\nğŸ”„ Move-only mode activated.")
+        from utils.file_mover import pick_sources_interactively, process_sources
+        sources = args.sources or pick_sources_interactively()
+        if not sources:
+            print("No sources selected. Exiting.")
+            sys.exit(0)
+
+        process_sources(
+            sources=sources,
+            mode=args.target,
+            dry_run=args.dry_run,
+            verbose=verbose,
+            debug=debug,
+            db_conn=db_conn
+        )
+        sys.exit(0)
+
+    # Full media ingest mode
+    try:
+        if args.all or args.videos:
+            handle_media(logger, "Videos",
+                         ["/multimedia/Videos", "/multimedia/Home_Videos", "/multimedia/TikTok"],
+                         VIDEO_EXTS,
+                         dry_run=args.dry_run,
+                         debug=debug,
+                         verbose=verbose,
+                         config_file=config_file,
+                         config_section=config_section)
+
+        if args.all or args.photos:
+            handle_media(logger, "Photos",
+                         ["/multimedia/Photos"],
+                         IMAGE_EXTS,
+                         dry_run=args.dry_run,
+                         debug=debug,
+                         verbose=verbose,
+                         config_file=config_file,
+                         config_section=config_section)
+
+    except Exception as e:
+        app_failed("media_manager", f"Fatal error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+
+
+--- Content of ./app_utils.py ---
+import logging
+import os
+import sys
+from datetime import datetime
+import json
+
+def setup_logging(app_name):
+    logger = logging.getLogger(app_name)
+    logger.setLevel(logging.DEBUG)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    log_dir = os.path.expanduser("~/Dropbox/Documents/Logs/")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"{app_name}_{date_str}.log")
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.DEBUG)
+    stream_handler.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    return logger
+
+def app_failed(app_name, message):
+    logging.getLogger(app_name).error(f"{app_name.upper()} ERROR: {message}")
+
+def load_media_types(config_path="config/media_types.json"):
+    try:
+        with open(config_path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to load media types from {config_path}: {e}")
+        return {}
+
+def load_metadata_mappings(path="config/metadata_mappings.json"):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"Could not load metadata mappings: {e}")
+        return {}
 
 
 --- Content of ./old-processmedia.txt ---
@@ -1416,365 +3237,7 @@ if __name__ == "__main__":
 
 
 
---- Content of ./app_utils.py ---
-import logging
-import os
-import sys
-from datetime import datetime
-import json
-
-def setup_logging(app_name):
-    logger = logging.getLogger(app_name)
-    logger.setLevel(logging.DEBUG)
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    log_dir = os.path.expanduser("~/Dropbox/Documents/Logs/")
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"{app_name}_{date_str}.log")
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.DEBUG)
-    stream_handler.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
-
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-
-    logger.addHandler(stream_handler)
-    logger.addHandler(file_handler)
-    logger.propagate = False
-    return logger
-
-def app_failed(app_name, message):
-    logging.getLogger(app_name).error(f"{app_name.upper()} ERROR: {message}")
-
-def load_media_types(config_path="config/media_types.json"):
-    try:
-        with open(config_path, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        logging.warning(f"Failed to load media types from {config_path}: {e}")
-        return {}
-
-def load_metadata_mappings(path="config/metadata_mappings.json"):
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        logging.warning(f"Could not load metadata mappings: {e}")
-        return {}
-
-
 --- Content of ./combined_output.txt ---
-
---- Content of ./config/media_types.json ---
-{
-  "Images": [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".heic", ".raw", ".cr2", ".nef", ".orf", ".sr2", ".arw", ".dng", ".rw2", ".pef"],
-  "Videos": [".mp4", ".mov", ".avi", ".mkv", ".flv", ".wmv", ".webm", ".mpeg", ".mpg", ".3gp", ".m4v", ".mts", ".m2ts", ".ts", ".vob", ".divx", ".xvid"],
-  "Audio": [".mp3", ".aac", ".wav", ".flac", ".ogg", ".wma", ".m4a", ".aiff", ".alac"],
-  "Documents": [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf"]
-}
-
-
---- Content of ./config/metadata_mappings.json ---
-{
-  "Videos": {
-	"FileName": "file_name",
-	"Directory": "file_location",
-    "CreateDate": "date_taken",
-    "ImageSize": "resolution",
-    "FileSize": "size",
-    "Make": "camera_make",
-    "Model": "camera_model",
-    "Duration": "duration",
-    "VideoFrameRate": "frame_rate",
-    "LightMeter": "light_meter",
-    "LensID": "lens_id",
-    "LensSpec": "lens_spec",
-    "CircleOfConfusion": "circle_of_confusion",
-    "Altitude": "altitude",
-    "ShutterSpeed": "shutter_speed",
-    "Aperture": "aperture",
-    "ISO": "iso",
-    "Flash": "flash"
-  }
-}
-
-
---- Content of ./managers/db_manager.py ---
-from db_connection import execute_query
-
-def get_media_id_by_filename(db_conn, filename, media_type, logger):
-    table = "Photos" if media_type == "Photos" else "Videos"
-    query = f"SELECT id FROM {table} WHERE file_name = %s"
-    logger.debug(f"Querying {table} for filename: {filename}")
-    result = execute_query(db_conn, query, (filename,))
-    return result[0][0] if result else None
-
-def update_media_date_taken(db_conn, media_id, new_datetime, media_type, logger):
-    table = "Photos" if media_type == "Photos" else "Videos"
-    query = f"UPDATE {table} SET date_taken = %s WHERE id = %s"
-    logger.debug(f"Executing SQL: {query} with params=({new_datetime}, {media_id})")
-    try:
-        execute_query(db_conn, query, (new_datetime, media_id))
-        logger.info(f"Updated {media_type} ID {media_id} with date_taken={new_datetime}")
-    except Exception as e:
-        logger.error(f"Update failed for {media_type} ID {media_id}: {e}")
-
-
---- Content of ./managers/media_transfer.py ---
-import os
-import shutil
-import logging
-from pathlib import Path
-
-def transfer_files(sources, target, dry_run=False, remove_sources=False):
-    target = Path(target).expanduser()
-    os.makedirs(target, exist_ok=True)
-
-    for source in sources:
-        source_path = Path(source).expanduser()
-        if not source_path.exists():
-            logging.warning(f"Source path {source_path} does not exist.")
-            continue
-
-        for root, _, files in os.walk(source_path):
-            for name in files:
-                src = Path(root) / name
-                dst = target / name
-
-                prefix = "DRY_RUN: " if dry_run else ""
-                logging.info(f"{prefix}Transfer {src} -> {dst}")
-
-                if not dry_run:
-                    shutil.copy2(src, dst)
-                    if remove_sources:
-                        try:
-                            os.remove(src)
-                            logging.info(f"Removed source file: {src}")
-                        except Exception as e:
-                            logging.error(f"Failed to remove source file {src}: {e}")
-                elif remove_sources:
-                    logging.info(f"DRY_RUN: Would remove {src}")
-
-
-
---- Content of ./managers/media_manager.py ---
-# managers/media_manager.py
-
-import argparse
-import sys
-import os
-import subprocess
-import json
-from pathlib import Path
-from datetime import datetime
-import logging
-from app_utils import setup_logging, app_failed, load_media_types, load_metadata_mappings
-from metadata_parser import select_oldest_datetime
-from db_connection import connect_to_database
-import re
-from utils.media_utils import (
-    get_existing_media_record,
-    insert_new_media_record,
-    update_missing_media_fields
-)
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-EXT_MAP = load_media_types()
-IMAGE_EXTS = set(EXT_MAP.get("Photos", []))
-VIDEO_EXTS = set(EXT_MAP.get("Videos", []))
-AUDIO_EXTS = set(EXT_MAP.get("Audio", []))
-DOCUMENT_EXTS = set(EXT_MAP.get("Documents", []))
-
-MAPPINGS = load_metadata_mappings()
-
-def get_exiftool_data(file_path, logger):
-    command = ["exiftool", "-j", file_path]
-    logger.debug(f"Running command: {' '.join(command)}")
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        metadata = json.loads(result.stdout)[0]
-        logger.debug(f"Raw ExifTool metadata: {metadata}")
-        return metadata
-    except Exception as e:
-        logger.warning(f"ExifTool failed for {file_path}: {e}")
-        return {}
-
-"""
-def update_media_record(db_conn, media_id, metadata, media_type, logger, dry_run=False):
-    if not metadata:
-        logger.debug(f"No metadata to update for {media_id}")
-        return
-
-    # Determine valid fields (assume DB columns match ExifTool keys in snake_case)
-    columns = []
-    values = []
-
-    for key, value in metadata.items():
-        # Skip complex/nested fields or nulls
-        if isinstance(value, (list, dict)) or value in ("", None):
-            continue
-
-        # Convert ExifTool keys like "CreateDate" to "create_date"
-        column_name = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
-
-        if column_name == "source_file":
-            continue  # skip filename
-
-        columns.append(column_name)
-        values.append(value)
-
-    if not columns:
-        logger.debug(f"No updatable metadata fields found for ID {media_id}")
-        return
-
-    set_clause = ", ".join([f"{col} = %s" for col in columns])
-    query = f"UPDATE {media_type} SET {set_clause} WHERE id = %s"
-    values.append(media_id)
-
-    logger.debug(f"SQL UPDATE: {query}")
-    logger.debug(f"Values: {values}")
-
-    if dry_run:
-        logger.info(f"DRY_RUN: Would update {media_type} ID {media_id} with metadata")
-    else:
-        try:
-            execute_query(db_conn, query, tuple(values))
-            logger.info(f"Updated {media_type} ID {media_id} with {len(columns)} metadata fields")
-        except Exception as e:
-            logger.error(f"Failed to update ID {media_id}: {e}")
-"""
-
-def list_valid_files(root_dir, extensions, logger):
-    for root, _, files in os.walk(root_dir):
-        logger.debug(f"Scanning: {root}")
-        for file in files:
-            ext = os.path.splitext(file)[1].lower()
-            if ext in extensions:
-                yield os.path.join(root, file)
-            else:
-                logger.debug(f"Skipping unsupported: {file}")
-
-def process_media_files(logger, source_dirs, valid_exts, db_conn,
-                        dry_run=False, debug=False, verbose=False, media_type="Videos"):
-
-    if dry_run:
-        debug = verbose = True
-
-    media_files = [fp for d in source_dirs for fp in list_valid_files(d, valid_exts, logger)]
-    total_files = len(media_files)
-    logger.info(f"[{media_type}] Total files: {total_files}")
-
-    updated = skipped = inserted = unmatched = 0
-    batch_limit = 10
-    insert_batch = []
-    update_batch = []
-
-    for idx, file_path in enumerate(media_files, 1):
-        prefix = f"[{media_type}] [{idx}/{total_files}]"
-        logger.info(f"{prefix} Processing: {file_path}" if verbose else f"{prefix}")
-
-        file_name = os.path.basename(file_path)
-        metadata = get_exiftool_data(file_path, logger)
-
-        if "CreateDate" not in metadata:
-            fallback_dt = select_oldest_datetime({}, logger, filename=file_name)
-            if fallback_dt:
-                metadata["CreateDate"] = fallback_dt.strftime("%Y:%m:%d %H:%M:%S")
-                logger.debug(f"Using fallback datetime: {metadata['CreateDate']}")
-                logger.debug("Running fallback datetime parser, not using execute_query")
-                logger.debug(f"select_oldest_datetime received: {file_name}")
-
-        if db_conn:
-            existing = get_existing_media_record(db_conn, file_name, media_type, logger)
-            if existing:
-                update_batch.append((file_path, existing["id"], metadata, existing))
-            else:
-                insert_batch.append((file_path, metadata))
-        else:
-            logger.info(f"DRY_RUN: Would process metadata for {file_name}")
-            skipped += 1
-
-        # Batch flush
-        if len(insert_batch) >= batch_limit:
-            for file_path, record in insert_batch:
-                insert_new_media_record(db_conn, record, media_type, logger, dry_run, file_path=file_path)
-                inserted += 1
-            insert_batch.clear()
-
-        if len(update_batch) >= batch_limit:
-            for file_path, media_id, record, existing_row in update_batch:
-                update_missing_media_fields(db_conn, media_id, record, existing_row, media_type, logger, dry_run, file_path=file_path)
-                updated += 1
-            update_batch.clear()
-
-    # Final flush
-    for file_path, record in insert_batch:
-        insert_new_media_record(db_conn, record, media_type, logger, dry_run, file_path=file_path)
-        inserted += 1
-
-    for file_path, media_id, record, existing_row in update_batch:
-        update_missing_media_fields(db_conn, media_id, record, existing_row, media_type, logger, dry_run, file_path=file_path)
-        updated += 1
-
-    logger.info(f"[{media_type}] Summary: scanned={total_files}, inserted={inserted}, updated={updated}, skipped={skipped}, unmatched={unmatched}")
-
-def handle_media(logger, media_type, source_dirs, ext_set,
-                 dry_run=False, debug=False, verbose=False,
-                 config_file=None, config_section=None):
-
-    logger.info(f"Handling {media_type} files...")
-    db_conn = None if dry_run else connect_to_database(config_file, config_section)
-    process_media_files(logger, source_dirs, ext_set, db_conn,
-                        dry_run=dry_run, debug=debug, verbose=verbose,
-                        media_type=media_type)
-
-def main():
-    parser = argparse.ArgumentParser(description="Unified Media Manager")
-    parser.add_argument("--videos", action="store_true")
-    parser.add_argument("--photos", action="store_true")
-    parser.add_argument("--all", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--debug", action="store_true")
-    args = parser.parse_args()
-
-    logger = setup_logging("media_manager")
-    debug = args.debug or args.dry_run
-    verbose = args.verbose or args.dry_run
-    if debug:
-        logger.setLevel(logging.DEBUG)
-
-    try:
-        config_file = os.path.expanduser("~/.my.cnf")
-        config_section = "media"
-
-        if args.all or args.videos:
-            handle_media(logger, "Videos",
-                         ["/multimedia/Videos", "/multimedia/Home_Videos", "/multimedia/TikTok"],
-                         VIDEO_EXTS,
-                         dry_run=args.dry_run, debug=debug, verbose=verbose,
-                         config_file=config_file, config_section=config_section)
-
-        if args.all or args.photos:
-            handle_media(logger, "Photos",
-                         ["/multimedia/Photos"],
-                         IMAGE_EXTS,
-                         dry_run=args.dry_run, debug=debug, verbose=verbose,
-                         config_file=config_file, config_section=config_section)
-
-    except Exception as e:
-        app_failed("media_manager", f"Fatal error: {e}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()
-
-
-
---- Content of ./managers/__init__.py ---
 
 --- Content of ./metadata_parser.py ---
 import subprocess
