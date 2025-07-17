@@ -17,3 +17,26 @@ def update_media_date_taken(db_conn, media_id, new_datetime, media_type, logger)
     except Exception as e:
         logger.error(f"Update failed for {media_type} ID {media_id}: {e}")
 
+def store_metadata(db_conn, metadata):
+    """
+    Inserts or updates metadata for a media file in the database.
+    Assumes a table like MediaProcessing with columns: file_path, processed, processed_at, etc.
+    """
+    try:
+        query = """
+            INSERT INTO MediaProcessing (file_path, processed, processed_at)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE processed = VALUES(processed), processed_at = VALUES(processed_at)
+        """
+        params = (
+            metadata["file_path"],
+            1,
+            metadata.get("date_taken") or datetime.now().isoformat()
+        )
+        cursor = db_conn.cursor()
+        cursor.execute(query, params)
+        db_conn.commit()
+        cursor.close()
+    except Exception as e:
+        print(f"[DB] Failed to store metadata for {metadata['file_path']}: {e}")
+

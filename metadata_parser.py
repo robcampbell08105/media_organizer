@@ -68,3 +68,22 @@ def select_oldest_datetime(date_map, logger, filename=None):
             logger.debug(f"Filename fallback failed: {e}")
     return None
 
+def parse_metadata(file_path, logger=None):
+    if logger is None:
+        class NullLogger:
+            def debug(self, *args, **kwargs): pass
+            def info(self, *args, **kwargs): pass
+            def warning(self, *args, **kwargs): pass
+        logger = NullLogger()
+
+    date_map = extract_datetimes(file_path, logger)
+    best_dt = select_oldest_datetime(date_map, logger, filename=file_path)
+
+    metadata = {
+        "file_path": file_path,
+        "date_taken": best_dt.isoformat() if best_dt else None,
+        "date_fields": {k: v.isoformat() for k, v in date_map.items()}
+    }
+
+    return metadata
+

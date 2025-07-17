@@ -6,6 +6,11 @@ from pathlib import Path
 import getpass
 # Import db-backed processor skip logic if needed
 from db_connection import is_processed  # Optional — depends on integration
+from metadata_parser import extract_datetimes, select_oldest_datetime
+import logging
+import argparse
+
+logger = logging.getLogger(__name__)  # optional: pass your main app logger instead
 
 def extract_create_date(file_path):
     file_name = os.path.basename(file_path)
@@ -33,10 +38,15 @@ def is_tiktok(file_path):
     base = os.path.basename(file_path)
     return len(base) == 32 and base.isalnum()
 
-def move_file(file_path, target_base, dry_run=False, verbose=False):
+def move_file(file_path, target_base, date=None, dry_run=False, verbose=False, remove=False):
+    """
     date = extract_create_date(file_path)
     if not date:
         if verbose: print(f"[SKIP] No date found: {file_path}")
+        return
+    """
+    if not date:
+        if verbose: print(f"[SKIP] move_file called without valid date: {file_path}")
         return
 
     target_dir = Path(target_base) / str(date)
@@ -49,8 +59,9 @@ def move_file(file_path, target_base, dry_run=False, verbose=False):
         return
 
     rsync_cmd = ["rsync", "-rltD"]
-    if not dry_run:
+    if not dry_run and remove:
         rsync_cmd.append("--remove-source-files")
+
     rsync_cmd += [file_path, str(target_dir)]
 
     print(f"{'[DRY_RUN]' if dry_run else '[MOVE]'} {file_path} → {target_dir}")
@@ -136,29 +147,44 @@ def resolve_target(file_path, mode="local"):
 
     return None
 
-def process_sources(sources, mode="local", dry_run=False, verbose=False, debug=False, db_conn=None):
+def process_sources(sources, mode="local", dry_run=False, verbose=False, debug=False, db_conn=None, remove=False):
     if not sources:
         print("No media sources provided.")
         return
 
     for source in sources:
         print(f"\n🔍 Scanning: {source}")
-        for root, _, files in os.walk(source):
-            for name in files:
-                file_path = os.path.join(root, name)
+        for root, dirs, files in os.walk(source):
+            # 🔒 Skip hidden directories (those starting with '.')
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
 
-                if ".thumbnail" in file_path or ".thumbnails" in file_path:
-                    if verbose: print(f"[SKIP] Thumbnail file: {file_path}")
+            for name in files:
+                if name.startswith("."):
+                    if verbose: print(f"[SKIP] Hidden file: {name}")
                     continue
+
+                file_path = os.path.join(root, name)
 
                 if db_conn and is_processed(db_conn, file_path):
                     if verbose: print(f"[SKIP] Already processed: {file_path}")
                     continue
 
-                target = resolve_target(file_path, mode=mode)
-                if not target:
+                target_base = resolve_target(file_path, mode=mode)
+                if not target_base:
                     if debug: print(f"[SKIP] Unknown target for: {file_path}")
                     continue
 
-                move_file(file_path, target, dry_run=dry_run, verbose=verbose)
+                # 🧠 Pull all known date fields via ExifTool
+                date_map = extract_datetimes(file_path, logger)
+                #best_date = select_oldest_datetime(date_map, logger, filename=name)
+
+                best_date = select_oldest_datetime(date_map, logger, filename=os.path.basename(file_path))
+
+                if not best_date:
+                    if verbose: print(f"[SKIP] No valid date extracted for: {file_path}")
+                    continue
+
+                # 🗂️ Move using best date
+                target_dir = Path(resolve_target(file_path, mode=mode)) / best_date.date().isoformat()
+                move_file(file_path, target_base, date=best_date.date(), dry_run=dry_run, verbose=verbose, remove=False)
 
